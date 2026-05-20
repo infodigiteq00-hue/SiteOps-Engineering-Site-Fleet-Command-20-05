@@ -651,6 +651,106 @@ export function useDeleteMachineMutation() {
   });
 }
 
+export type CategoryCompanyTarget = {
+  companyId: string;
+  count: number;
+};
+
+export type RenameCategoryInput = {
+  oldCategory: string;
+  newCategory: string;
+  companyTargets: CategoryCompanyTarget[];
+};
+
+export function useRenameCategoryMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ oldCategory, newCategory, companyTargets }: RenameCategoryInput) => {
+      const trimmed = newCategory.trim();
+      const previous = oldCategory.trim();
+      if (!trimmed) throw new Error("Category name is required");
+      if (trimmed === previous) throw new Error("Category name is unchanged");
+      if (companyTargets.length === 0) throw new Error("No machinery in this category");
+
+      const actor = peekCurrentUser();
+      let totalUpdated = 0;
+
+      for (const { companyId, count } of companyTargets) {
+        const { error } = await supabase
+          .from("machinery")
+          .update({ category: trimmed })
+          .eq("category", previous)
+          .eq("company_id", companyId);
+        if (error) throw error;
+
+        totalUpdated += count;
+        try {
+          await appendAuditLedgerEntry({
+            companyId,
+            eventKind: "machinery_category_renamed",
+            summary: `Category renamed: "${previous}" → "${trimmed}" (${count} unit${count === 1 ? "" : "s"}).`,
+            machineIds: [],
+            requester: actor?.name ?? "System",
+            approvedBy: actor?.name ?? "System",
+            approverRole: actor ? ROLE_LABELS[actor.role] : null,
+            totalUnits: count,
+          });
+        } catch (err) {
+          console.warn("[ledger] append skipped after machinery_category_renamed", err);
+        }
+      }
+
+      if (totalUpdated === 0) throw new Error("No machinery updated");
+    },
+    onSuccess: () => invalidateOperational(qc),
+  });
+}
+
+export type DeleteCategoryInput = {
+  category: string;
+  companyTargets: CategoryCompanyTarget[];
+};
+
+export function useDeleteCategoryMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ category, companyTargets }: DeleteCategoryInput) => {
+      if (companyTargets.length === 0) throw new Error("No machinery in this category");
+
+      const actor = peekCurrentUser();
+      let totalDeleted = 0;
+
+      for (const { companyId, count } of companyTargets) {
+        const { error } = await supabase
+          .from("machinery")
+          .delete()
+          .eq("category", category.trim())
+          .eq("company_id", companyId);
+        if (error) throw error;
+
+        totalDeleted += count;
+        try {
+          await appendAuditLedgerEntry({
+            companyId,
+            eventKind: "machinery_category_deleted",
+            summary: `Category "${category}" removed with ${count} unit(s).`,
+            machineIds: [],
+            requester: actor?.name ?? "System",
+            approvedBy: actor?.name ?? "System",
+            approverRole: actor ? ROLE_LABELS[actor.role] : null,
+            totalUnits: count,
+          });
+        } catch (err) {
+          console.warn("[ledger] append skipped after machinery_category_deleted", err);
+        }
+      }
+
+      if (totalDeleted === 0) throw new Error("No machinery deleted");
+    },
+    onSuccess: () => invalidateOperational(qc),
+  });
+}
+
 export type AddMachineryUnit = {
   code: string;
   name: string;

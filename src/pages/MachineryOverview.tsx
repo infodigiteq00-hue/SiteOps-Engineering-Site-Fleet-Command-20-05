@@ -4,17 +4,10 @@ import { differenceInCalendarDays, format } from "date-fns";
 import { Search } from "lucide-react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AddMachineryDialog } from "@/components/AddMachineryDialog";
+import { CategoryOverviewCard, type CategorySummary } from "@/components/CategoryOverviewCard";
 import { useCurrentUser } from "@/lib/session";
 import { canAddMachinery } from "@/lib/rbac";
 import { useScopedMachines, useScopedSites, useScopedLedger } from "@/hooks/useCompanyScope";
-
-type CategorySummary = {
-  category: string;
-  total: number;
-  assigned: number;
-  maintenance: number;
-  available: number;
-};
 
 const MachineryOverview = () => {
   const user = useCurrentUser();
@@ -39,7 +32,20 @@ const MachineryOverview = () => {
     });
   }, [machines, query, siteById]);
 
-  const categorySummaries = useMemo<CategorySummary[]>(() => {
+  const companyTargetsByCategory = useMemo(() => {
+    const map = new Map<string, Map<string, number>>();
+    filteredMachines.forEach((machine) => {
+      let byCompany = map.get(machine.category);
+      if (!byCompany) {
+        byCompany = new Map();
+        map.set(machine.category, byCompany);
+      }
+      byCompany.set(machine.companyId, (byCompany.get(machine.companyId) ?? 0) + 1);
+    });
+    return map;
+  }, [filteredMachines]);
+
+  const categorySummaries = useMemo(() => {
     const grouped = new Map<string, CategorySummary>();
 
     filteredMachines.forEach((machine) => {
@@ -161,23 +167,18 @@ const MachineryOverview = () => {
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {categorySummaries.map((summary) => (
-          <button
+          <CategoryOverviewCard
             key={summary.category}
-            type="button"
-            onClick={() => setSelectedCategory(summary.category)}
-            className="rounded-xl border border-border bg-card p-4 text-left shadow-card transition-colors hover:border-primary/30"
-          >
-            <div className="text-4xl font-display font-bold leading-none tabular-nums">{summary.total}</div>
-            <h3 className="mt-2 text-sm font-medium text-muted-foreground">{summary.category}</h3>
-
-            <div className="mt-4 border-t border-border pt-3 text-xs text-muted-foreground">
-              <span className="tabular-nums">{summary.assigned} deployed</span>
-              <span className="mx-2 text-border">•</span>
-              <span className="tabular-nums">{summary.maintenance} maintenance</span>
-              <span className="mx-2 text-border">•</span>
-              <span className="tabular-nums">{summary.available} available</span>
-            </div>
-          </button>
+            summary={summary}
+            companyTargets={Array.from(companyTargetsByCategory.get(summary.category)?.entries() ?? []).map(
+              ([companyId, count]) => ({ companyId, count }),
+            )}
+            canManage={canAddMachinery(user.role)}
+            onSelect={() => setSelectedCategory(summary.category)}
+            onCategoryRenamed={(oldName, newName) => {
+              if (selectedCategory === oldName) setSelectedCategory(newName);
+            }}
+          />
         ))}
         {categorySummaries.length === 0 && (
           <div className="col-span-full rounded-xl border border-dashed border-border bg-card/50 px-4 py-10 text-center text-sm text-muted-foreground">

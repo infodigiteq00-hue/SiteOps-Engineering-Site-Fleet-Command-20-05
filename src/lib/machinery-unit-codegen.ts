@@ -78,7 +78,7 @@ export function takeMachineryUnitsFromCursor(
   quantity: number,
   reservedCodes: Set<string>,
 ): Array<{ code: string; name: string }> {
-  const safeQty = Math.max(1, quantity);
+  const safeQty = Math.max(0, quantity);
   const units: Array<{ code: string; name: string }> = [];
 
   for (let i = 0; i < safeQty; i += 1) {

@@ -173,8 +173,8 @@ function parseBulkStructural(
       if (!projectName) throw new Error(`Row ${index + 1}: project name is required.`);
       if (!projectLocation) throw new Error(`Row ${index + 1}: location is required.`);
       if (!category) throw new Error(`Row ${index + 1}: category is required.`);
-      if (!Number.isFinite(qty) || qty < 1) {
-        throw new Error(`Row ${index + 1}: qty must be a whole number of 1 or more.`);
+      if (!Number.isFinite(qty) || qty < 0) {
+        throw new Error(`Row ${index + 1}: qty must be a whole number of 0 or more.`);
       }
       if (!unitTypeLabel) throw new Error(`Row ${index + 1}: unit_type is required (e.g. nos, metre).`);
 
@@ -188,6 +188,8 @@ function parseBulkStructural(
         cursor = seedCategoryCodegen(category, machines, reservedCodes);
         categoryCursors.set(categoryKey, cursor);
       }
+
+      if (qty === 0) return;
 
       const generated = takeMachineryUnitsFromCursor(cursor, qty, reservedCodes);
       generated.forEach((unit) => {
@@ -550,6 +552,15 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       toast({ title: "Could not parse CSV", description: structured.error, variant: "destructive" });
       return;
     }
+    if (structured.rows.length === 0) {
+      toast({
+        title: "No units to import",
+        description: "Every row has qty 0. Set qty to at least 1 on rows where you want machinery created.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     const codeErr = bulkValidationUniqueCodes(structured.rows, machines);
     if (codeErr) {
       toast({ title: "Could not validate import", description: codeErr, variant: "destructive" });
@@ -1141,7 +1152,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   CSV columns (6): <span className="font-mono">projectName, location, category, qty, unit_type, status</span>
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  <span className="font-mono">qty</span> is how many units to create; codes and names are auto-generated (same as Single Add).{" "}
+                  <span className="font-mono">qty</span> is how many units to create (0 or more); codes and names are auto-generated (same as Single Add).{" "}
                   <span className="font-mono">unit_type</span>: nos, metre, kg, or any custom label (e.g. tonne).
                 </p>
                 <p className="text-xs text-muted-foreground">
