@@ -1,0 +1,160 @@
+import { useMemo } from "react";
+import { format, isValid, parseISO } from "date-fns";
+import { ArrowDownToLine, ArrowUpFromLine, Pencil } from "lucide-react";
+import type { LedgerEntry, Machine } from "@/domain/types";
+import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  classifySiteHistoryEntry,
+  isMovementEntry,
+  movementDateIso,
+  parseGatePassFromSummary,
+  resolveMachineryDetails,
+  sortSiteHistoryEntries,
+  type SiteHistoryRowType,
+} from "@/lib/site-allocation-history";
+
+type Props = {
+  siteId: string;
+  ledger: LedgerEntry[];
+  machines: Machine[];
+  allowEdit?: boolean;
+  onEditEntry?: (entry: LedgerEntry) => void;
+};
+
+function formatHistoryDate(iso: string): string {
+  const parsed = parseISO(iso.includes("T") ? iso : `${iso}T12:00:00`);
+  if (!isValid(parsed)) return "—";
+  return format(parsed, "dd MMM yyyy");
+}
+
+function typeBadge(type: SiteHistoryRowType) {
+  if (type === "in") {
+    return (
+      <Badge className="gap-1 border-emerald-200 bg-emerald-100 text-emerald-800 hover:bg-emerald-100">
+        <ArrowDownToLine className="h-3 w-3" />
+        IN
+      </Badge>
+    );
+  }
+  return (
+    <Badge className="gap-1 border-amber-200 bg-amber-100 text-amber-900 hover:bg-amber-100">
+      <ArrowUpFromLine className="h-3 w-3" />
+      OUT
+    </Badge>
+  );
+}
+
+function rowClassName(type: SiteHistoryRowType): string {
+  if (type === "in") {
+    return "border-l-4 border-l-emerald-500 bg-emerald-50/70 hover:bg-emerald-50";
+  }
+  return "border-l-4 border-l-amber-500 bg-amber-50/70 hover:bg-amber-50";
+}
+
+export function SiteAllocationHistory({ siteId, ledger, machines, allowEdit = false, onEditEntry }: Props) {
+  const entries = useMemo(() => {
+    const movementOnly = ledger.filter((row) => row.siteId === siteId && isMovementEntry(row));
+    return sortSiteHistoryEntries(movementOnly);
+  }, [ledger, siteId]);
+
+  return (
+    <div>
+      <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
+        <h2 className="font-display text-lg font-semibold">Allocation History</h2>
+        {entries.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            {entries.length} movement record{entries.length === 1 ? "" : "s"}
+          </p>
+        )}
+      </div>
+
+      <div className="overflow-hidden rounded-xl border border-border bg-card shadow-card">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
+            <thead className="border-b border-border bg-secondary/40 text-left text-xs uppercase tracking-wider text-muted-foreground">
+              <tr>
+                <th className="px-4 py-2.5 font-medium">Type</th>
+                <th className="px-4 py-2.5 font-medium">Date</th>
+                <th className="px-4 py-2.5 font-medium">Machinery</th>
+                <th className="px-4 py-2.5 text-right font-medium">Qty</th>
+                <th className="px-4 py-2.5 font-medium">Gate pass</th>
+                <th className="px-4 py-2.5 font-medium">Recorded by</th>
+                {allowEdit && <th className="px-4 py-2.5 text-right font-medium">Action</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {entries.length === 0 && (
+                <tr>
+                  <td colSpan={allowEdit ? 7 : 6} className="px-4 py-8 text-center text-muted-foreground">
+                    No IN/OUT movements yet. Use Manage Machinery to log entries.
+                  </td>
+                </tr>
+              )}
+              {entries.map((entry) => {
+                const type = classifySiteHistoryEntry(entry);
+                const dateIso = movementDateIso(entry);
+                const machinery = resolveMachineryDetails(entry, machines);
+                const gatePass = parseGatePassFromSummary(entry.summary);
+
+                return (
+                  <tr key={entry.id} className={cn("border-b border-border last:border-0", rowClassName(type))}>
+                    <td className="px-4 py-3">{typeBadge(type)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{formatHistoryDate(dateIso)}</td>
+                    <td className="px-4 py-3">
+                      <div className="font-medium leading-snug">{machinery}</div>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <span
+                        className={cn(
+                          "inline-flex min-w-[2rem] justify-center rounded-md px-2 py-0.5 font-semibold tabular-nums",
+                          type === "in" ? "bg-emerald-200/80 text-emerald-900" : "bg-amber-200/80 text-amber-900",
+                        )}
+                      >
+                        {entry.totalUnits || entry.machineIds.length || "—"}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      {gatePass !== "—" ? (
+                        <span className="font-mono text-xs font-medium text-foreground">{gatePass}</span>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground">{entry.approvedBy || entry.requester || "—"}</td>
+                    {allowEdit && (
+                      <td className="px-4 py-3 text-right">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="gap-1"
+                          onClick={() => onEditEntry?.(entry)}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                          Edit
+                        </Button>
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="mt-2 flex flex-wrap gap-4 text-xs text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-sm bg-emerald-500" />
+          Machinery IN
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-sm bg-amber-500" />
+          Machinery OUT
+        </span>
+      </div>
+    </div>
+  );
+}
