@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Users, MailPlus, Loader2 } from "lucide-react";
 import { ROLE_LABELS, useCurrentUser, type PlatformRole } from "@/lib/session";
-import { canManageCompanyUsers } from "@/lib/rbac";
+import { canAccessTeamPage } from "@/lib/rbac";
 import { supabase, isSupabaseConfigured } from "@/lib/supabaseClient";
 import { formatCompanyLabel } from "@/lib/companyTenancy";
 import {
@@ -277,7 +277,7 @@ const Team = () => {
     void load();
   };
 
-  if (!canManageCompanyUsers(user.role)) {
+  if (!canAccessTeamPage(user.role)) {
     return (
       <div className="rounded-xl border border-border bg-card p-8 text-center text-sm text-muted-foreground">
         Team management is available to Firm Admins only.

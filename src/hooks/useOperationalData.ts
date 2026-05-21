@@ -163,6 +163,30 @@ export function useCompanyNameMap(): Record<string, string> {
   return useMemo(() => Object.fromEntries((data ?? []).map((c) => [c.id, c.name])), [data]);
 }
 
+/** First-load gate for AppShell: wait for core operational queries before rendering routes. */
+export function useOperationalBootstrap() {
+  const { isSupabaseEnabled, session } = useAuth();
+  const sites = useSitesQuery();
+  const machinery = useMachineryQuery();
+  const requests = useRequestsQuery();
+  const ledger = useLedgerQuery();
+
+  const enabled = isSupabaseEnabled && Boolean(session);
+  const queries = [sites, machinery, requests, ledger] as const;
+
+  const isBootstrapping = enabled && queries.some((q) => q.isPending && !q.isFetched);
+  const failed = queries.find((q) => q.isError);
+  const hasError = enabled && Boolean(failed);
+  const errorMessage =
+    failed?.error instanceof Error
+      ? failed.error.message
+      : failed?.error
+        ? String(failed.error)
+        : "Could not load organization data.";
+
+  return { isBootstrapping, hasError, errorMessage };
+}
+
 function invalidateOperational(qc: ReturnType<typeof useQueryClient>) {
   void qc.invalidateQueries({ queryKey: operationalKeys.all });
 }

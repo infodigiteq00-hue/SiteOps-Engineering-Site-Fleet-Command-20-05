@@ -135,15 +135,6 @@ const MachineryOverview = () => {
       });
   }, [activeCategory, activeStatusTab, filteredMachines, query, latestLedgerByMachineId, siteById]);
 
-  if (user.role === "site_manager") {
-    return (
-      <div className="rounded-xl border border-border bg-card p-8 text-center text-sm text-muted-foreground">
-        Category-wide machinery overview is available to Firm Admin, Senior Managers, and Store Managers. Switch role in the sidebar to
-        explore this view.
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">

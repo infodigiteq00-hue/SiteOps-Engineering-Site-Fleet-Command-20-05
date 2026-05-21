@@ -22,13 +22,7 @@ const NewRequest = () => {
   const requests = useScopedRequests();
   const createRequestMutation = useCreateRequestMutation();
   const user = useCurrentUser();
-  const eligibleSites = useMemo(
-    () =>
-      user.role === "site_manager"
-        ? sites.filter((site) => user.assignedSiteIds.includes(site.id))
-        : [...sites],
-    [sites, user.role, user.assignedSiteIds],
-  );
+  const eligibleSites = useMemo(() => [...sites], [sites]);
 
   const available = machines.filter((m) => m.status === "available");
   const categoryOptions = useMemo(

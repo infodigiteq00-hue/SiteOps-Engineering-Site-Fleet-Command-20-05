@@ -37,7 +37,7 @@ const Dashboard = () => {
   const machineryDeployedValue = metrics.isLoading ? "…" : formatCount(metrics.assigned);
   const machineryDeployedTrend = metrics.isLoading
     ? "…"
-    : `of ${formatCount(metrics.totalMachines)} total · ${metrics.utilization.toFixed(1)}% ${user.role === "site_manager" ? "at your sites" : "utilization"}`;
+    : `of ${formatCount(metrics.totalMachines)} total · ${metrics.utilization.toFixed(1)}% utilization`;
   const totalSitePages = Math.max(1, Math.ceil(sitesForTab.length / SITES_PER_PAGE));
   const firstSiteIndex = (sitesPage - 1) * SITES_PER_PAGE;
   const paginatedSites = sitesForTab.slice(firstSiteIndex, firstSiteIndex + SITES_PER_PAGE);

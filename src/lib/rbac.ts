@@ -1,11 +1,21 @@
 import type { PlatformRole } from "@/lib/session";
 
-export function canCreateSite(role: PlatformRole): boolean {
-  return role === "firm_admin" || role === "senior_manager" || role === "site_manager" || role === "super_admin";
+/** Senior Manager and Site Manager share operational UI powers; Site Manager cannot open Team. */
+export function hasSeniorManagerCapabilities(role: PlatformRole): boolean {
+  return role === "senior_manager" || role === "site_manager";
 }
 
+export function canCreateSite(role: PlatformRole): boolean {
+  return role === "firm_admin" || hasSeniorManagerCapabilities(role) || role === "super_admin";
+}
+
+/** Firm Admin only — Team tab and user invites. */
 export function canManageCompanyUsers(role: PlatformRole): boolean {
   return role === "firm_admin";
+}
+
+export function canAccessTeamPage(role: PlatformRole): boolean {
+  return canManageCompanyUsers(role);
 }
 
 export function canAccessPlatformAdmin(role: PlatformRole): boolean {
@@ -22,7 +32,7 @@ export function canAddMachinery(role: PlatformRole): boolean {
   );
 }
 
-/** Legacy request-submit flow (viewer / other roles only). Site managers use senior-style approve + add machinery. */
+/** Legacy request-submit flow (viewer / other roles only). */
 export function canCreateMachineryRequest(role: PlatformRole): boolean {
   return false;
 }
@@ -37,17 +47,12 @@ export function canApproveRequests(role: PlatformRole): boolean {
   );
 }
 
-/** Site card edit actions (name, managers, finish workflow) — same as senior manager. */
+/** Site card edit actions (name, managers, finish workflow). */
 export function canUpdateSite(role: PlatformRole): boolean {
-  return (
-    role === "super_admin" ||
-    role === "firm_admin" ||
-    role === "senior_manager" ||
-    role === "site_manager"
-  );
+  return role === "super_admin" || role === "firm_admin" || hasSeniorManagerCapabilities(role);
 }
 
-/** Super Admin crosses companies; Site Manager uses assignments; everyone else stays within `userCompanyId`. */
+/** Super Admin crosses companies; company roles stay within `userCompanyId`. */
 export function canAccessSite(
   role: PlatformRole,
   siteId: string,
@@ -55,8 +60,9 @@ export function canAccessSite(
   siteCompanyId?: string | null,
   userCompanyId?: string | null,
 ): boolean {
+  void siteId;
+  void assignedSiteIds;
   if (role === "super_admin") return true;
-  if (role === "site_manager") return assignedSiteIds.includes(siteId);
   if (!userCompanyId || !siteCompanyId) return true;
   return userCompanyId === siteCompanyId;
 }

@@ -3,39 +3,27 @@ import type { Machine } from "@/domain/types";
 import { useCurrentUser } from "@/lib/session";
 import { useMachineryQuery, useRequestsQuery, useLedgerQuery, useSitesQuery } from "@/hooks/useOperationalData";
 
-/** Sites visible under company tenancy + Site Manager assignments. Super Admin sees all companies. */
+/** Sites visible under company tenancy. Super Admin sees all companies. */
 export function useScopedSites() {
   const { data: sites = [] } = useSitesQuery();
   const user = useCurrentUser();
 
   return useMemo(() => {
-    let list = sites;
-    if (user.role !== "super_admin" && user.companyId) {
-      list = sites.filter((s) => s.companyId === user.companyId);
-    }
-    if (user.role === "site_manager") {
-      const allow = new Set(user.assignedSiteIds);
-      return list.filter((s) => allow.has(s.id));
-    }
-    return list;
-  }, [sites, user.role, user.companyId, user.assignedSiteIds]);
+    if (user.role === "super_admin") return sites;
+    if (user.companyId) return sites.filter((s) => s.companyId === user.companyId);
+    return sites;
+  }, [sites, user.role, user.companyId]);
 }
 
 export function useScopedMachines() {
   const { data: machines = [] } = useMachineryQuery();
-  const scopedSites = useScopedSites();
   const user = useCurrentUser();
 
   return useMemo((): Machine[] => {
     if (user.role === "super_admin") return machines;
-
-    const companyScoped = machines.filter((m) => user.companyId && m.companyId === user.companyId);
-
-    if (user.role !== "site_manager") return companyScoped;
-
-    const siteIds = new Set(scopedSites.map((s) => s.id));
-    return companyScoped.filter((m) => !m.assignedSiteId || siteIds.has(m.assignedSiteId));
-  }, [machines, scopedSites, user.role, user.companyId]);
+    if (user.companyId) return machines.filter((m) => m.companyId === user.companyId);
+    return machines;
+  }, [machines, user.role, user.companyId]);
 }
 
 export function useScopedRequests() {
@@ -54,10 +42,7 @@ export function useScopedLedger() {
   const user = useCurrentUser();
   return useMemo(() => {
     if (user.role === "super_admin") return ledger;
-    const ids = new Set(scopedSites.map((s) => s.id));
-    return ledger.filter((row) => {
-      if (!row.siteId) return user.role !== "site_manager";
-      return ids.has(row.siteId);
-    });
-  }, [ledger, scopedSites, user.role]);
+    if (user.companyId) return ledger.filter((row) => row.companyId === user.companyId);
+    return ledger;
+  }, [ledger, user.role, user.companyId]);
 }

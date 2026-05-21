@@ -49,7 +49,7 @@ const SiteDetail = () => {
   if (!canAccessSite(user.role, site.id, user.assignedSiteIds, site.companyId, user.companyId)) {
     return (
       <div className="rounded-xl border border-border bg-card p-8 text-sm text-muted-foreground">
-        This site is not assigned to your account. Contact your Firm Admin if you should have access.
+        This site is outside your organisation. Contact your Firm Admin if you should have access.
       </div>
     );
   }

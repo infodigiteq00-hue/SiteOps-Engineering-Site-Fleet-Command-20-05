@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ROLE_LABELS, initialsFromName, useCurrentUser, type PlatformRole } from "@/lib/session";
-import { canCreateSite, canManageCompanyUsers, canAccessPlatformAdmin } from "@/lib/rbac";
+import { canCreateSite, canAccessTeamPage, canAccessPlatformAdmin } from "@/lib/rbac";
 import { useScopedRequests } from "@/hooks/useCompanyScope";
 import { useOperationalBootstrap } from "@/hooks/useOperationalData";
 import { useAuth } from "@/contexts/AuthContext";
@@ -42,7 +42,7 @@ function buildNav(role: PlatformRole): NavItem[] {
     { to: "/requests", label: "Requests", icon: ClipboardList },
     { to: "/ledger", label: "Audit Ledger", icon: ScrollText },
   );
-  if (canManageCompanyUsers(role)) {
+  if (canAccessTeamPage(role)) {
     items.push({ to: "/team", label: "Team", icon: Users });
   }
   if (canAccessPlatformAdmin(role)) {

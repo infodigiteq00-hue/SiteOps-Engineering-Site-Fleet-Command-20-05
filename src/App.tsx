@@ -17,7 +17,7 @@ import Requests from "./pages/Requests.tsx";
 import NewRequest from "./pages/NewRequest.tsx";
 import NewSite from "./pages/NewSite.tsx";
 import Ledger from "./pages/Ledger.tsx";
-import Team from "./pages/Team.tsx";
+import { TeamRoute } from "./components/TeamRoute";
 import PlatformAdmin from "./pages/PlatformAdmin.tsx";
 import NotFound from "./pages/NotFound.tsx";
 import Login from "./pages/Login.tsx";
@@ -61,7 +61,7 @@ const App = () => (
                 <Route path="/requests" element={<Requests />} />
                 <Route path="/requests/new" element={<NewRequest />} />
                 <Route path="/ledger" element={<Ledger />} />
-                <Route path="/team" element={<Team />} />
+                <Route path="/team" element={<TeamRoute />} />
                 <Route
                   path="/platform"
                   element={
