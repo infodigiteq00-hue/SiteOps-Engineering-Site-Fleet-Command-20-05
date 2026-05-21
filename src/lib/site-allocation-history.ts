@@ -89,6 +89,11 @@ export function machineryLineKey(machine: Machine): string {
 }
 
 export const CUSTOM_MOVEMENT_SOURCE_VALUE = "__new__";
+
+/** Store sends brand-new machinery to site (OUT); only when internal direction is `"in"`. */
+export const NEW_MACHINES_SOURCE_VALUE = "__new_machines__";
+
+export const NEW_MACHINES_POOL_LABEL = "New machines";
 export const CUSTOM_STATUS_SELECT_PREFIX = "custom:";
 
 export function customStatusSelectValue(label: string): string {
@@ -138,6 +143,9 @@ export function parseSourcePoolFromSummary(summary?: string): {
   if (lower === "maintenance") return { isCustom: false, customLabel: "", sourceStatus: "maintenance" };
   if (lower === "lost/damaged" || lower === "lost_damaged") {
     return { isCustom: false, customLabel: "", sourceStatus: "lost_damaged" };
+  }
+  if (lower === NEW_MACHINES_POOL_LABEL.toLowerCase()) {
+    return { isCustom: true, customLabel: NEW_MACHINES_POOL_LABEL, sourceStatus: "assigned" };
   }
   return { isCustom: true, customLabel: poolLabel, sourceStatus: "available" };
 }

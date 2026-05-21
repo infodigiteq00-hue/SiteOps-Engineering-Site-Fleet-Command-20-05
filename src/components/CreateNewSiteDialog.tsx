@@ -1,19 +1,39 @@
-import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, Upload } from "lucide-react";
 import { toast } from "@/hooks/use-toast";
 import { ROLE_LABELS, useCurrentUser } from "@/lib/session";
-import { useScopedMachines, useScopedSites } from "@/hooks/useCompanyScope";
+import { useScopedMachines } from "@/hooks/useCompanyScope";
 import {
   appendAuditLedgerEntry,
+  useAddMachineryMutation,
   useCompaniesQuery,
   useCreateSiteMutation,
+  useMachineryQuery,
+  useSitesQuery,
 } from "@/hooks/useOperationalData";
 import {
-  SITE_BULK_SAMPLE_CSV,
-  parseSiteBulkCsv,
-  validateSiteBulkImport,
-  type SiteBulkImportRow,
-} from "@/lib/site-bulk-upload";
+  assertBulkImportCodesAreNew,
+  buildBulkSiteResolutionsAndQueue,
+  bulkGroupParsedRows,
+  bulkGroupsToTemplatePreviewRows,
+  bulkValidationUniqueCodes,
+  MACHINERY_BULK_SAMPLE_CSV,
+  parseBulkStructural,
+  siteAssignmentKey,
+  siteDeploymentExists,
+  siteNameTakenForCompany,
+  type BulkParsedRow,
+  type BulkPreviewGroup,
+  type BulkSiteConfirmItem,
+  type BulkSiteResolution,
+} from "@/lib/machinery-bulk-upload";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Dialog,
   DialogContent,
@@ -33,15 +53,38 @@ import {
 
 type Mode = "single" | "bulk";
 
+type BulkWizardUi = {
+  mode: "case1-choice" | "case1-edit" | "case2-choice" | "case2-enterNew";
+  nameDraft: string;
+};
+
+type BulkWizardState = {
+  queue: BulkSiteConfirmItem[];
+  index: number;
+  stagingRows: BulkParsedRow[];
+  resolutions: Record<string, BulkSiteResolution>;
+  pendingNormNames: Set<string>;
+  ui: BulkWizardUi;
+};
+
+function wizardUiSeed(item: BulkSiteConfirmItem): BulkWizardUi {
+  if (item.existingSite) {
+    return { mode: "case2-choice", nameDraft: item.csvProjectName.trim() };
+  }
+  return { mode: "case1-choice", nameDraft: item.csvProjectName.trim() };
+}
+
 const inputCls = "w-full rounded-md border border-border bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring/30";
 const labelCls = "mb-1.5 block text-xs font-medium uppercase tracking-wider text-muted-foreground";
 
 export function CreateNewSiteDialog() {
   const user = useCurrentUser();
   const scopedMachines = useScopedMachines();
-  const scopedSites = useScopedSites();
+  const { data: machines = [] } = useMachineryQuery();
+  const { data: sites = [] } = useSitesQuery();
   const { data: companies = [] } = useCompaniesQuery();
   const createSiteMutation = useCreateSiteMutation();
+  const addMachineryMutation = useAddMachineryMutation();
 
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<Mode>("single");
@@ -49,7 +92,11 @@ export function CreateNewSiteDialog() {
   const [form, setForm] = useState({ name: "", location: "", machineIds: [] as string[] });
   const [bulkCsv, setBulkCsv] = useState("");
   const [bulkFileName, setBulkFileName] = useState("");
-  const [bulkPreview, setBulkPreview] = useState<SiteBulkImportRow[] | null>(null);
+  const [bulkPreview, setBulkPreview] = useState<BulkPreviewGroup[] | null>(null);
+  const [bulkResolutions, setBulkResolutions] = useState<Record<string, BulkSiteResolution>>({});
+  const [bulkImporting, setBulkImporting] = useState(false);
+  const [bulkWizard, setBulkWizard] = useState<BulkWizardState | null>(null);
+  const bulkWizardRef = useRef<BulkWizardState | null>(null);
   const [isBulkDragActive, setIsBulkDragActive] = useState(false);
   const bulkFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -58,6 +105,10 @@ export function CreateNewSiteDialog() {
       setOrganisationId(companies[0].id);
     }
   }, [user.role, companies, organisationId]);
+
+  useEffect(() => {
+    bulkWizardRef.current = bulkWizard;
+  }, [bulkWizard]);
 
   const availableMachines = useMemo(
     () => scopedMachines.filter((machine) => machine.status === "available"),
@@ -72,6 +123,9 @@ export function CreateNewSiteDialog() {
     setBulkCsv("");
     setBulkFileName("");
     setBulkPreview(null);
+    setBulkResolutions({});
+    setBulkWizard(null);
+    setBulkImporting(false);
     setIsBulkDragActive(false);
   };
 
@@ -83,6 +137,41 @@ export function CreateNewSiteDialog() {
         : [...current.machineIds, id],
     }));
   };
+
+  const finishBulkWizardStep = useCallback(
+    (wiz: BulkWizardState, resolution: BulkSiteResolution, pendingNormNames: Set<string>): BulkWizardState | null => {
+      const stepKey = wiz.queue[wiz.index].key;
+      const resolutions = { ...wiz.resolutions, [stepKey]: resolution };
+      const nextIndex = wiz.index + 1;
+      if (nextIndex >= wiz.queue.length) {
+        try {
+          const groups = bulkGroupParsedRows(wiz.stagingRows, resolutions, machines, resolvedCompanyId || null);
+          setBulkResolutions(resolutions);
+          setBulkPreview(groups);
+          const total = groups.reduce((sum, g) => sum + g.units.length, 0);
+          toast({
+            title: "Preview ready",
+            description: `Site setup finished. Review ${total} new machinery unit(s) to add — existing sites and fleet are unchanged.`,
+          });
+        } catch (err) {
+          toast({
+            title: "Could not prepare preview",
+            description: err instanceof Error ? err.message : "Something went wrong mapping sites.",
+            variant: "destructive",
+          });
+        }
+        return null;
+      }
+      return {
+        ...wiz,
+        resolutions,
+        pendingNormNames,
+        index: nextIndex,
+        ui: wizardUiSeed(wiz.queue[nextIndex]),
+      };
+    },
+    [machines, resolvedCompanyId],
+  );
 
   const onSingleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -96,7 +185,9 @@ export function CreateNewSiteDialog() {
     }
     try {
       await createSiteMutation.mutateAsync({
-        ...form,
+        name: form.name.trim(),
+        location: form.location.trim(),
+        machineIds: form.machineIds,
         companyId: resolvedCompanyId,
       });
       toast({
@@ -122,23 +213,126 @@ export function CreateNewSiteDialog() {
       toast({ title: "No company", description: "Pick a company before previewing bulk upload.", variant: "destructive" });
       return;
     }
-    const parsed = parseSiteBulkCsv(csvInput);
-    if (!parsed.ok) {
-      toast({ title: "Invalid CSV", description: parsed.error, variant: "destructive" });
+    const structured = parseBulkStructural(csvInput, machines, resolvedCompanyId);
+    if (!structured.ok) {
+      toast({ title: "Invalid CSV", description: structured.error, variant: "destructive" });
       return;
     }
-    const validated = validateSiteBulkImport(parsed.rows, scopedSites, scopedMachines, resolvedCompanyId);
-    if (!validated.ok) {
-      toast({ title: "Cannot import", description: validated.error, variant: "destructive" });
-      return;
-    }
-    setBulkPreview(validated.rows);
-    const skippedTotal = validated.rows.reduce((n, r) => n + r.skippedMachineryCodes.length, 0);
-    if (skippedTotal > 0) {
+    if (structured.rows.length === 0) {
       toast({
-        title: "Preview ready",
-        description: `${skippedTotal} code(s) in the CSV are not in your available pool (or were already used earlier in this file). Sites will still be created; see the review table for details.`,
+        title: "No units to import",
+        description: "All rows have qty 0 or no net new units. Adjust qty and try again.",
+        variant: "destructive",
       });
+      return;
+    }
+    const codeErr = bulkValidationUniqueCodes(structured.rows, machines);
+    if (codeErr) {
+      toast({ title: "Cannot import", description: codeErr, variant: "destructive" });
+      return;
+    }
+
+    const companySites = sites.filter((s) => s.companyId === resolvedCompanyId);
+    const { resolutions, queue } = buildBulkSiteResolutionsAndQueue(structured.rows, companySites, resolvedCompanyId, {
+      autoResolveExactMatches: false,
+      includeAllDeployments: true,
+    });
+
+    if (queue.length === 0) {
+      try {
+        const groups = bulkGroupParsedRows(structured.rows, resolutions, machines, resolvedCompanyId);
+        setBulkResolutions(resolutions);
+        setBulkPreview(groups);
+        toast({
+          title: "Preview ready",
+          description: `Review ${groups.reduce((n, g) => n + g.units.length, 0)} new unit(s). Confirm to create sites and add machinery.`,
+        });
+      } catch (err) {
+        toast({
+          title: "Could not prepare preview",
+          description: err instanceof Error ? err.message : "Check CSV layout.",
+          variant: "destructive",
+        });
+      }
+      return;
+    }
+
+    setBulkWizard({
+      queue,
+      index: 0,
+      stagingRows: structured.rows,
+      resolutions,
+      pendingNormNames: new Set(),
+      ui: wizardUiSeed(queue[0]),
+    });
+    toast({
+      title: "Site confirmation",
+      description: `${queue.length} deployment${queue.length !== 1 ? "s need" : " needs"} your choice before preview (step 1 of ${queue.length}).`,
+    });
+  };
+
+  const onBulkConfirm = async () => {
+    if (!bulkPreview?.length || !resolvedCompanyId || bulkImporting) return;
+    setBulkImporting(true);
+    try {
+      const flatRows = bulkPreview.flatMap((group) =>
+        group.units.map((unit) => ({
+          category: group.category,
+          status: group.status,
+          projectName: unit.projectName,
+          projectLocation: unit.projectLocation,
+          unitType: group.unitType,
+          code: unit.code,
+          name: unit.name,
+        })),
+      );
+      assertBulkImportCodesAreNew(flatRows, machines);
+
+      let added = 0;
+      for (const group of bulkPreview) {
+        const { siteName: _s, existingUnitCount: _e, ...payload } = group;
+        await addMachineryMutation.mutateAsync({
+          category: payload.category,
+          status: payload.status,
+          assignedSiteId: payload.assignedSiteId,
+          companyId: resolvedCompanyId,
+          unitType: payload.unitType,
+          units: payload.units,
+          ledgerImportTag: "bulk_csv",
+        });
+        added += payload.units.length;
+      }
+
+      try {
+        await appendAuditLedgerEntry({
+          companyId: resolvedCompanyId,
+          eventKind: "bulk_upload_completed",
+          summary: `Bulk sites CSV import finished: machinery added for ${Object.keys(bulkResolutions).length} deployment(s), ${added} new unit(s). Existing fleet unchanged.`,
+          siteId: null,
+          machineIds: [],
+          requester: user.name,
+          approvedBy: user.name,
+          approverRole: ROLE_LABELS[user.role],
+          totalUnits: added,
+        });
+      } catch (err) {
+        console.warn("[ledger] bulk sites summary skipped", err);
+      }
+
+      toast({
+        title: "Import complete",
+        description: `${added} new machinery unit(s) added. Sites were created or matched during preview; existing machinery was not changed.`,
+      });
+      setOpen(false);
+      resetForm();
+    } catch (err) {
+      toast({
+        title: "Import stopped",
+        description: err instanceof Error ? err.message : "Try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setBulkImporting(false);
     }
   };
 
@@ -147,6 +341,7 @@ export function CreateNewSiteDialog() {
     setBulkCsv(text);
     setBulkFileName(file.name);
     setBulkPreview(null);
+    setBulkWizard(null);
   };
 
   const onBulkFileSelected = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -166,344 +361,506 @@ export function CreateNewSiteDialog() {
   };
 
   const downloadSampleTemplate = () => {
-    const blob = new Blob([SITE_BULK_SAMPLE_CSV], { type: "text/csv;charset=utf-8;" });
+    const blob = new Blob([MACHINERY_BULK_SAMPLE_CSV], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "sites-bulk-upload-template.csv";
+    link.download = "bulk-upload-template.csv";
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
   };
 
-  const onBulkConfirm = async () => {
-    if (!bulkPreview?.length || !resolvedCompanyId) return;
-    let created = 0;
-    try {
-      for (const row of bulkPreview) {
-        await createSiteMutation.mutateAsync({
-          name: row.siteName,
-          location: row.location,
-          machineIds: row.machineIds,
-          companyId: resolvedCompanyId,
-          createdDuringBulkUpload: true,
-        });
-        created += 1;
-      }
-      try {
-        await appendAuditLedgerEntry({
-          companyId: resolvedCompanyId,
-          eventKind: "bulk_upload_completed",
-          summary: `Bulk sites CSV import finished: ${created} new site(s) added. Existing sites were not changed.`,
-          siteId: null,
-          machineIds: [],
-          requester: user.name,
-          approvedBy: user.name,
-          approverRole: ROLE_LABELS[user.role],
-          totalUnits: created,
-        });
-      } catch (err) {
-        console.warn("[ledger] bulk sites summary skipped", err);
-      }
+  const abortBulkWizard = () => {
+    setBulkWizard(null);
+    toast({ title: "Upload canceled", description: "Site setup was canceled. Nothing was imported." });
+  };
+
+  const bulkWizardStepItem =
+    bulkWizard && bulkWizard.index < bulkWizard.queue.length ? bulkWizard.queue[bulkWizard.index] : null;
+  const bulkWizardSaving = createSiteMutation.isPending;
+
+  const updateWizardNameDraft = (value: string) => {
+    setBulkWizard((prev) => (prev ? { ...prev, ui: { ...prev.ui, nameDraft: value } } : null));
+  };
+
+  const onBulkUseExistingSiteFromWizard = () => {
+    setBulkWizard((prev) => {
+      if (!prev) return null;
+      const item = prev.queue[prev.index];
+      if (!item.existingSite) return prev;
+      return finishBulkWizardStep(
+        prev,
+        { siteId: item.existingSite.id, displayName: item.existingSite.name },
+        prev.pendingNormNames,
+      );
+    });
+  };
+
+  const onBulkWizardCase1EditMode = () => {
+    setBulkWizard((prev) =>
+      prev ? { ...prev, ui: { mode: "case1-edit", nameDraft: prev.queue[prev.index].csvProjectName.trim() } } : null,
+    );
+  };
+
+  const onBulkWizardCase2EnterNewNameMode = () => {
+    setBulkWizard((prev) =>
+      prev ? { ...prev, ui: { mode: "case2-enterNew", nameDraft: prev.queue[prev.index].csvProjectName.trim() } } : null,
+    );
+  };
+
+  const onBulkWizardBackToChoice = () => {
+    setBulkWizard((prev) => (prev ? { ...prev, ui: wizardUiSeed(prev.queue[prev.index]) } : null));
+  };
+
+  const onBulkWizardCreateSite = async () => {
+    const wiz = bulkWizardRef.current;
+    if (!wiz) return;
+    const item = wiz.queue[wiz.index];
+    const trimmed =
+      wiz.ui.mode === "case1-edit" || wiz.ui.mode === "case2-enterNew"
+        ? wiz.ui.nameDraft.trim()
+        : item.csvProjectName.trim();
+    const location = item.csvLocation.trim();
+
+    if (!resolvedCompanyId) {
+      toast({ title: "No company", description: "Pick a company before creating a site.", variant: "destructive" });
+      return;
+    }
+    if (
+      siteDeploymentExists(sites, trimmed, location, resolvedCompanyId, wiz.pendingNormNames) ||
+      siteNameTakenForCompany(trimmed, resolvedCompanyId, sites, wiz.pendingNormNames)
+    ) {
       toast({
-        title: "Sites imported",
-        description:
-          bulkPreview.reduce((n, r) => n + r.skippedMachineryCodes.length, 0) > 0
-            ? `${created} new site(s) added. Some machinery codes were skipped (demo/sample codes must exist in your fleet as Available). Existing sites were unchanged.`
-            : `${created} new site(s) added. Existing sites were kept.`,
+        title: "Site already exists",
+        description: `"${trimmed}" at "${location}" already exists. Use "Use existing site" or choose a different name.`,
+        variant: "destructive",
       });
-      setOpen(false);
-      resetForm();
+      return;
+    }
+
+    const markerKey = item.key;
+    const markerIdx = wiz.index;
+
+    try {
+      const siteId = await createSiteMutation.mutateAsync({
+        name: trimmed,
+        location,
+        machineIds: [],
+        companyId: resolvedCompanyId,
+        createdDuringBulkUpload: true,
+      });
+      const nextPending = new Set(wiz.pendingNormNames);
+      nextPending.add(siteAssignmentKey(trimmed, location));
+
+      setBulkWizard((prev) => {
+        if (!prev || prev.index !== markerIdx || prev.queue[prev.index]?.key !== markerKey) return prev;
+        return finishBulkWizardStep(prev, { siteId, displayName: trimmed }, nextPending);
+      });
     } catch (err) {
       toast({
-        title: "Import stopped",
-        description:
-          err instanceof Error
-            ? `${err.message} (${created} site(s) were created before the error.)`
-            : `Try again. (${created} site(s) were created before the error.)`,
+        title: "Could not create site",
+        description: err instanceof Error ? err.message : "Try again.",
         variant: "destructive",
       });
     }
   };
 
+  const templatePreviewRows = bulkPreview ? bulkGroupsToTemplatePreviewRows(bulkPreview) : [];
+
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        setOpen(nextOpen);
-        if (!nextOpen) resetForm();
-      }}
-    >
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-card transition-colors hover:bg-blue-500"
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && bulkImporting) return;
+          setOpen(nextOpen);
+          if (!nextOpen) resetForm();
+        }}
       >
-        <Plus className="h-3.5 w-3.5" />
-        Create new site
-      </button>
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="inline-flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-card transition-colors hover:bg-blue-500"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Create new site
+        </button>
 
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
-        <DialogHeader>
-          <DialogTitle className="font-display text-xl">Create New Site</DialogTitle>
-          <DialogDescription>
-            Add site details and allot machinery from available units owned by your organisation. Bulk upload adds new sites
-            alongside existing ones.
-          </DialogDescription>
-        </DialogHeader>
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle className="font-display text-xl">Create New Site</DialogTitle>
+            <DialogDescription>
+              Add site details and allot machinery from available units. Bulk upload uses the same 6-column CSV as Add machinery.
+            </DialogDescription>
+          </DialogHeader>
 
-        <div className="grid gap-2 sm:grid-cols-2">
-          <button
-            type="button"
-            onClick={() => setMode("single")}
-            className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-              mode === "single"
-                ? "border-primary bg-primary text-primary-foreground"
-                : "border-border bg-card text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            Single site
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode("bulk")}
-            className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-              mode === "bulk"
-                ? "border-primary bg-primary text-primary-foreground"
-                : "border-border bg-card text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            Bulk upload
-          </button>
-        </div>
-
-        {user.role === "super_admin" && (
-          <div>
-            <label className={labelCls}>Company (tenancy)</label>
-            <Select value={organisationId} onValueChange={setOrganisationId} disabled={companies.length === 0}>
-              <SelectTrigger className={inputCls}>
-                <SelectValue placeholder={companies.length ? "Choose company" : "Loading companies…"} />
-              </SelectTrigger>
-              <SelectContent>
-                {companies.map((c) => (
-                  <SelectItem key={c.id} value={c.id}>
-                    {c.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => setMode("single")}
+              className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                mode === "single"
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-border bg-card text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Single site
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("bulk")}
+              className={`rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                mode === "bulk"
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-border bg-card text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Bulk upload
+            </button>
           </div>
-        )}
 
-        {mode === "single" ? (
-          <form onSubmit={onSingleSubmit} className="space-y-5">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <label className={labelCls}>Site name</label>
-                <input
-                  className={inputCls}
-                  value={form.name}
-                  onChange={(e) => setForm((current) => ({ ...current, name: e.target.value }))}
-                  placeholder="e.g. Essar Steel - Hazira"
-                  maxLength={90}
-                />
-              </div>
-              <div>
-                <label className={labelCls}>Location</label>
-                <input
-                  className={inputCls}
-                  value={form.location}
-                  onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}
-                  placeholder="e.g. Hazira, Gujarat"
-                  maxLength={90}
-                />
-              </div>
-            </div>
-
+          {user.role === "super_admin" && (
             <div>
-              <div className="mb-2 flex items-center justify-between">
-                <label className={`${labelCls} mb-0`}>Allot machinery (available only)</label>
-                <span className="text-xs text-muted-foreground">{form.machineIds.length} selected</span>
-              </div>
-              <div className="grid max-h-56 gap-1.5 overflow-y-auto rounded-md border border-border bg-background p-2 sm:grid-cols-2">
-                {availableMachines.map((machine) => {
-                  const checked = form.machineIds.includes(machine.id);
-                  return (
-                    <label
-                      key={machine.id}
-                      className={`flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-2 text-sm transition-colors ${
-                        checked ? "border-accent bg-accent/10" : "border-transparent hover:bg-secondary"
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleMachine(machine.id)}
-                        className="h-4 w-4 accent-[hsl(var(--accent))]"
-                      />
-                      <div className="min-w-0">
-                        <div className="font-medium">{machine.category}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {machine.code} · {machine.name}
-                        </div>
-                      </div>
-                    </label>
-                  );
-                })}
-                {availableMachines.length === 0 && (
-                  <div className="col-span-2 p-4 text-center text-sm text-muted-foreground">No available machinery to allot.</div>
-                )}
-              </div>
+              <label className={labelCls}>Company (tenancy)</label>
+              <Select value={organisationId} onValueChange={setOrganisationId} disabled={companies.length === 0}>
+                <SelectTrigger className={inputCls}>
+                  <SelectValue placeholder={companies.length ? "Choose company" : "Loading companies…"} />
+                </SelectTrigger>
+                <SelectContent>
+                  {companies.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
+          )}
 
-            <DialogFooter className="border-t border-border pt-4 sm:justify-end">
-              <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={createSiteMutation.isPending} className="bg-accent text-accent-foreground hover:opacity-90">
-                {createSiteMutation.isPending ? "Creating…" : "Create site"}
-              </Button>
-            </DialogFooter>
-          </form>
-        ) : (
-          <div className="space-y-3">
-            {bulkPreview ? (
-              <div className="space-y-2">
-                <p className="text-sm font-medium">Review import ({bulkPreview.length} new site(s))</p>
-                <p className="text-xs text-muted-foreground">
-                  Existing sites are not removed or changed. Confirm to append these sites to your fleet.
-                </p>
-                <div className="max-h-56 overflow-auto rounded-md border border-border">
-                  <table className="w-full text-xs">
-                    <thead className="sticky top-0 border-b border-border bg-secondary/60 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
-                      <tr>
-                        <th className="px-2 py-1.5 font-medium">Site name</th>
-                        <th className="px-2 py-1.5 font-medium">Location</th>
-                        <th className="px-2 py-1.5 font-medium">Machinery</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {bulkPreview.map((row) => (
-                        <tr key={`${row.siteName}-${row.location}`} className="border-b border-border/80 last:border-0">
-                          <td className="px-2 py-1.5 align-top">{row.siteName}</td>
-                          <td className="px-2 py-1.5 align-top">{row.location}</td>
-                          <td className="px-2 py-1.5 align-top text-[11px]">
-                            <div className="font-mono text-muted-foreground">
-                              {row.machineryCodes.length ? row.machineryCodes.join(", ") : "—"}
-                            </div>
-                            <div className="mt-1 text-foreground">
-                              {row.machineIds.length > 0
-                                ? `${row.machineIds.length} unit(s) will be allotted`
-                                : "No machinery allotted"}
-                            </div>
-                            {row.skippedMachineryCodes.length > 0 && (
-                              <div className="mt-1 text-amber-700 dark:text-amber-200/95">
-                                Skipped (not in Available pool / duplicate in row): {row.skippedMachineryCodes.join(", ")}
-                              </div>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+          {mode === "single" ? (
+            <form onSubmit={onSingleSubmit} className="space-y-5">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label className={labelCls}>Site name</label>
+                  <input
+                    className={inputCls}
+                    value={form.name}
+                    onChange={(e) => setForm((current) => ({ ...current, name: e.target.value }))}
+                    placeholder="e.g. Essar Steel - Hazira"
+                    maxLength={90}
+                  />
+                </div>
+                <div>
+                  <label className={labelCls}>Location</label>
+                  <input
+                    className={inputCls}
+                    value={form.location}
+                    onChange={(e) => setForm((current) => ({ ...current, location: e.target.value }))}
+                    placeholder="e.g. Hazira, Gujarat"
+                    maxLength={90}
+                  />
                 </div>
               </div>
-            ) : (
-              <>
-                <div className="w-full text-right">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setBulkCsv(SITE_BULK_SAMPLE_CSV);
-                      setBulkFileName("sample-sites-bulk.csv");
-                      onBulkPreview(SITE_BULK_SAMPLE_CSV);
-                    }}
-                    className="text-sm font-medium text-blue-600 underline-offset-2 hover:underline dark:text-sky-400"
-                  >
-                    Load sample data
-                  </button>
+
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <label className={`${labelCls} mb-0`}>Allot machinery (available only)</label>
+                  <span className="text-xs text-muted-foreground">{form.machineIds.length} selected</span>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  CSV columns: <span className="font-mono">site_name, location, machinery_codes</span> (codes optional; use{" "}
-                  <span className="font-mono">;</span> between codes). Codes must match real units in your org with status{" "}
-                  <strong>Available</strong>. Unknown or busy codes are skipped — sites are still created.
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button type="button" variant="outline" size="sm" onClick={downloadSampleTemplate}>
-                    Download template
-                  </Button>
-                  <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
-                    <Upload className="h-3.5 w-3.5" />
-                    Upload CSV
-                    <input ref={bulkFileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={onBulkFileSelected} />
-                  </label>
+                <div className="grid max-h-56 gap-1.5 overflow-y-auto rounded-md border border-border bg-background p-2 sm:grid-cols-2">
+                  {availableMachines.map((machine) => {
+                    const checked = form.machineIds.includes(machine.id);
+                    return (
+                      <label
+                        key={machine.id}
+                        className={`flex cursor-pointer items-center gap-2 rounded-md border px-2.5 py-2 text-sm transition-colors ${
+                          checked ? "border-accent bg-accent/10" : "border-transparent hover:bg-secondary"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleMachine(machine.id)}
+                          className="h-4 w-4 accent-[hsl(var(--accent))]"
+                        />
+                        <div className="min-w-0">
+                          <div className="font-medium">{machine.category}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {machine.code} · {machine.name}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                  {availableMachines.length === 0 && (
+                    <div className="col-span-2 p-4 text-center text-sm text-muted-foreground">No available machinery to allot.</div>
+                  )}
                 </div>
-                <div
-                  className={`rounded-md border border-dashed p-4 transition-colors ${
-                    isBulkDragActive ? "border-primary bg-primary/5" : "border-border bg-card/40"
-                  }`}
-                  onDrop={onBulkDrop}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    if (!isBulkDragActive) setIsBulkDragActive(true);
-                  }}
-                  onDragLeave={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    setIsBulkDragActive(false);
-                  }}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Upload className="h-3.5 w-3.5" />
-                      <span>Or drag and drop a CSV here</span>
-                    </div>
-                    <button
-                      type="button"
-                      className="text-xs font-medium text-primary underline-offset-2 hover:underline"
-                      onClick={() => bulkFileInputRef.current?.click()}
-                    >
-                      Browse files
-                    </button>
+              </div>
+
+              <DialogFooter className="border-t border-border pt-4 sm:justify-end">
+                <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={createSiteMutation.isPending} className="bg-accent text-accent-foreground hover:opacity-90">
+                  {createSiteMutation.isPending ? "Creating…" : "Create site"}
+                </Button>
+              </DialogFooter>
+            </form>
+          ) : (
+            <div className="space-y-3">
+              {bulkPreview ? (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium">
+                    Review import (+{bulkPreview.reduce((n, g) => n + g.units.length, 0)} new unit
+                    {bulkPreview.reduce((n, g) => n + g.units.length, 0) === 1 ? "" : "s"})
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Same 6-column template as Add machinery. Confirm to add new units; existing machinery is not changed.
+                  </p>
+                  <div className="max-h-56 overflow-auto rounded-md border border-border">
+                    <table className="min-w-[720px] text-xs">
+                      <thead className="sticky top-0 border-b border-border bg-secondary/60 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                        <tr>
+                          <th className="px-2 py-1.5 font-medium">projectName</th>
+                          <th className="px-2 py-1.5 font-medium">location</th>
+                          <th className="px-2 py-1.5 font-medium">category</th>
+                          <th className="px-2 py-1.5 font-medium">qty</th>
+                          <th className="px-2 py-1.5 font-medium">unit_type</th>
+                          <th className="px-2 py-1.5 font-medium">status</th>
+                          <th className="px-2 py-1.5 font-medium">Site</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {templatePreviewRows.map((row) => (
+                          <tr
+                            key={`${row.projectName}-${row.location}-${row.category}-${row.status}`}
+                            className="border-b border-border/80 last:border-0"
+                          >
+                            <td className="px-2 py-1.5 align-top">{row.projectName}</td>
+                            <td className="px-2 py-1.5 align-top">{row.location}</td>
+                            <td className="px-2 py-1.5 align-top">{row.category}</td>
+                            <td className="px-2 py-1.5 align-top tabular-nums">{row.qty}</td>
+                            <td className="px-2 py-1.5 align-top">{row.unitType}</td>
+                            <td className="px-2 py-1.5 align-top capitalize">{row.status}</td>
+                            <td className="px-2 py-1.5 align-top text-muted-foreground">{row.siteName ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 </div>
-                <div className="text-xs text-muted-foreground">
-                  {bulkFileName
-                    ? `Selected file: ${bulkFileName}`
-                    : "No file selected. Upload a .csv or use sample data to preview."}
-                </div>
-              </>
-            )}
-
-            <DialogFooter>
-              {bulkPreview ? (
-                <>
-                  <Button type="button" variant="outline" onClick={() => setBulkPreview(null)}>
-                    Back to file
-                  </Button>
-                  <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-                    Cancel
-                  </Button>
-                  <Button type="button" onClick={() => void onBulkConfirm()} disabled={createSiteMutation.isPending}>
-                    {createSiteMutation.isPending ? "Importing…" : "Confirm & import"}
-                  </Button>
-                </>
               ) : (
                 <>
-                  <Button type="button" variant="outline" onClick={() => setOpen(false)}>
-                    Cancel
-                  </Button>
-                  <Button type="button" onClick={() => onBulkPreview()} disabled={!bulkCsv.trim()}>
-                    Preview import
-                  </Button>
+                  <div className="w-full text-right">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBulkCsv(MACHINERY_BULK_SAMPLE_CSV);
+                        setBulkFileName("sample-bulk-data.csv");
+                        onBulkPreview(MACHINERY_BULK_SAMPLE_CSV);
+                      }}
+                      className="text-sm font-medium text-blue-600 underline-offset-2 hover:underline dark:text-sky-400"
+                    >
+                      Load sample data
+                    </button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    CSV columns (6): <span className="font-mono">projectName, location, category, qty, unit_type, status</span>
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    <span className="font-mono">qty</span> is the number of <span className="font-semibold text-foreground">new</span> units to
+                    add. Codes and names are auto-generated. If a site already exists, you can use it or create a new name.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button type="button" variant="outline" size="sm" onClick={downloadSampleTemplate}>
+                      Download template
+                    </Button>
+                    <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
+                      <Upload className="h-3.5 w-3.5" />
+                      Upload CSV
+                      <input ref={bulkFileInputRef} type="file" accept=".csv,text/csv" className="hidden" onChange={onBulkFileSelected} />
+                    </label>
+                  </div>
+                  <div
+                    className={`rounded-md border border-dashed p-4 transition-colors ${
+                      isBulkDragActive ? "border-primary bg-primary/5" : "border-border bg-card/40"
+                    }`}
+                    onDrop={onBulkDrop}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      if (!isBulkDragActive) setIsBulkDragActive(true);
+                    }}
+                    onDragLeave={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setIsBulkDragActive(false);
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <Upload className="h-3.5 w-3.5" />
+                        <span>Or drag and drop a CSV here</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-primary underline-offset-2 hover:underline"
+                        onClick={() => bulkFileInputRef.current?.click()}
+                      >
+                        Browse files
+                      </button>
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {bulkFileName
+                      ? `Selected file: ${bulkFileName}`
+                      : "No file selected. Upload a .csv or use sample data to preview."}
+                  </div>
                 </>
               )}
-            </DialogFooter>
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
+
+              <DialogFooter>
+                {bulkPreview ? (
+                  <>
+                    <Button type="button" variant="outline" onClick={() => setBulkPreview(null)}>
+                      Back to file
+                    </Button>
+                    <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                      Cancel
+                    </Button>
+                    <Button type="button" onClick={() => void onBulkConfirm()} disabled={bulkImporting || addMachineryMutation.isPending}>
+                      {bulkImporting ? "Importing…" : "Confirm & import"}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                      Cancel
+                    </Button>
+                    <Button type="button" onClick={() => onBulkPreview()} disabled={!bulkCsv.trim()}>
+                      Preview import
+                    </Button>
+                  </>
+                )}
+              </DialogFooter>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog
+        open={Boolean(bulkWizard && bulkWizardStepItem)}
+        onOpenChange={(next) => {
+          if (!next) abortBulkWizard();
+        }}
+      >
+        <AlertDialogContent className="z-[130] gap-4 sm:max-w-lg">
+          {bulkWizard && bulkWizardStepItem ? (
+            <>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  Bulk upload · Site {bulkWizard.index + 1} of {bulkWizard.queue.length}
+                </AlertDialogTitle>
+
+                {!bulkWizardStepItem.existingSite && bulkWizard.ui.mode === "case1-choice" ? (
+                  <AlertDialogDescription asChild>
+                    <div className="space-y-2 text-muted-foreground">
+                      <p>
+                        No site exists yet for &quot;{bulkWizardStepItem.csvProjectName}&quot; at &quot;{bulkWizardStepItem.csvLocation}&quot;.
+                      </p>
+                      <p>
+                        Create a new site named{' '}
+                        <span className="font-semibold text-foreground">{bulkWizardStepItem.csvProjectName.trim()}</span>?
+                      </p>
+                    </div>
+                  </AlertDialogDescription>
+                ) : null}
+
+                {bulkWizardStepItem.existingSite && bulkWizard.ui.mode === "case2-choice" ? (
+                  <AlertDialogDescription asChild>
+                    <div className="space-y-2 text-muted-foreground">
+                      <p>A site with this name already exists.</p>
+                      <p>
+                        Matched: <span className="font-semibold text-foreground">{bulkWizardStepItem.existingSite.name}</span> (
+                        {bulkWizardStepItem.existingSite.location}).
+                      </p>
+                      <p>
+                        <span className="font-semibold text-foreground">Use existing site</span> to add new machinery from your CSV, or enter a
+                        new name to create a separate site.
+                      </p>
+                    </div>
+                  </AlertDialogDescription>
+                ) : null}
+
+                {(bulkWizard.ui.mode === "case1-edit" || bulkWizard.ui.mode === "case2-enterNew") && (
+                  <>
+                    <AlertDialogDescription>Edit the site name below, then create the site.</AlertDialogDescription>
+                    <input
+                      className="mt-2 w-full rounded-md border border-border bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring/30"
+                      value={bulkWizard.ui.nameDraft}
+                      onChange={(event) => updateWizardNameDraft(event.target.value)}
+                      disabled={bulkWizardSaving}
+                    />
+                  </>
+                )}
+              </AlertDialogHeader>
+
+              <div className="flex w-full flex-wrap items-center justify-between gap-x-4 gap-y-2 pt-2">
+                {!bulkWizardStepItem.existingSite && bulkWizard.ui.mode === "case1-choice" ? (
+                  <>
+                    <Button type="button" variant="ghost" onClick={abortBulkWizard} disabled={bulkWizardSaving}>
+                      Cancel upload
+                    </Button>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Button type="button" variant="outline" onClick={onBulkWizardCase1EditMode} disabled={bulkWizardSaving}>
+                        Edit site name
+                      </Button>
+                      <Button type="button" onClick={() => void onBulkWizardCreateSite()} disabled={bulkWizardSaving}>
+                        Create site
+                      </Button>
+                    </div>
+                  </>
+                ) : null}
+
+                {(bulkWizard.ui.mode === "case1-edit" || bulkWizard.ui.mode === "case2-enterNew") ? (
+                  <>
+                    <Button type="button" variant="ghost" onClick={abortBulkWizard} disabled={bulkWizardSaving}>
+                      Cancel
+                    </Button>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Button type="button" variant="outline" onClick={onBulkWizardBackToChoice} disabled={bulkWizardSaving}>
+                        Back
+                      </Button>
+                      <Button type="button" onClick={() => void onBulkWizardCreateSite()} disabled={bulkWizardSaving}>
+                        Create site
+                      </Button>
+                    </div>
+                  </>
+                ) : null}
+
+                {bulkWizardStepItem.existingSite && bulkWizard.ui.mode === "case2-choice" ? (
+                  <>
+                    <Button type="button" variant="ghost" onClick={abortBulkWizard} disabled={bulkWizardSaving}>
+                      Cancel
+                    </Button>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Button type="button" variant="outline" onClick={onBulkWizardCase2EnterNewNameMode} disabled={bulkWizardSaving}>
+                        Enter new site name
+                      </Button>
+                      <Button type="button" onClick={onBulkUseExistingSiteFromWizard} disabled={bulkWizardSaving}>
+                        Use existing site
+                      </Button>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            </>
+          ) : null}
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }

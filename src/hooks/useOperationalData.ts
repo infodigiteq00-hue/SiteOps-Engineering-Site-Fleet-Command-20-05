@@ -887,6 +887,7 @@ export function useAddMachineryMutation() {
         };
       });
 
+      // Bulk CSV and single-add both insert new rows only — never update or delete existing machinery.
       const { error: insErr } = await supabase.from("machinery").insert(fixedRows);
       if (insErr) throw insErr;
 
@@ -910,6 +911,8 @@ export function useAddMachineryMutation() {
       } catch (err) {
         console.warn("[ledger] append skipped after machinery_created", err);
       }
+
+      return { machineIds: fixedRows.map((r) => r.id as string) };
     },
     onSuccess: () => invalidateOperational(qc),
   });

@@ -2,9 +2,12 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDownToLine, ArrowUpFromLine, Check, ChevronsUpDown, Truck } from "lucide-react";
 import { format } from "date-fns";
 import type { LedgerEntry, Machine, MachineryStatus, Site } from "@/domain/types";
+import { MACHINERY_CATEGORIES } from "@/domain/types";
 import { cn } from "@/lib/utils";
 import {
   CUSTOM_MOVEMENT_SOURCE_VALUE,
+  NEW_MACHINES_POOL_LABEL,
+  NEW_MACHINES_SOURCE_VALUE,
   customStatusSelectValue,
   isReservedSourcePoolLabel,
   isSavedCustomStatusSelect,
@@ -15,7 +18,17 @@ import {
   parseMovementEditFromLedger,
   type MachineryMovementDirection,
 } from "@/lib/site-allocation-history";
+import { seedCategoryCodegen, takeMachineryUnitsFromCursor } from "@/lib/machinery-unit-codegen";
 import {
+  CUSTOM_MACHINERY_UNIT_VALUE,
+  DEFAULT_MACHINERY_UNIT_TYPE,
+  MACHINERY_UNIT_TYPE_OPTIONS,
+  resolveMachineryUnitType,
+  type MachineryUnitType,
+  type PresetMachineryUnitType,
+} from "@/lib/machinery-unit-types";
+import {
+  useAddMachineryMutation,
   useMachinerySourceStatusesQuery,
   useRecordMachineryMovementMutation,
   useUpdateMachineryMovementMutation,
@@ -32,7 +45,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Command,
@@ -143,6 +156,7 @@ export function ManageMachineryDialog({
 }: Props) {
   const recordMutation = useRecordMachineryMovementMutation();
   const updateMutation = useUpdateMachineryMovementMutation();
+  const addMachineryMutation = useAddMachineryMutation();
   const { data: savedCustomStatuses = [] } = useMachinerySourceStatusesQuery(site.companyId);
   const [internalOpen, setInternalOpen] = useState(false);
   const isControlled = controlledOpen !== undefined;
@@ -167,29 +181,51 @@ export function ManageMachineryDialog({
   const [selectedLineKey, setSelectedLineKey] = useState("");
   const [quantity, setQuantity] = useState(1);
   const [machineryPickerOpen, setMachineryPickerOpen] = useState(false);
+  const [categorySelect, setCategorySelect] = useState("");
+  const [customCategory, setCustomCategory] = useState("");
+  const [categoryPickerOpen, setCategoryPickerOpen] = useState(false);
+  const [unitType, setUnitType] = useState<PresetMachineryUnitType | typeof CUSTOM_MACHINERY_UNIT_VALUE>(
+    DEFAULT_MACHINERY_UNIT_TYPE,
+  );
+  const [customUnitType, setCustomUnitType] = useState("");
 
-  const isNewCustomStatus = sourceSelect === CUSTOM_MOVEMENT_SOURCE_VALUE;
+  const isStoreToSite = direction === "in";
+  const isLegacyCustomDraft = sourceSelect === CUSTOM_MOVEMENT_SOURCE_VALUE;
+  const isNewMachinesMode = sourceSelect === NEW_MACHINES_SOURCE_VALUE;
   const isSavedCustomStatus = isSavedCustomStatusSelect(sourceSelect);
-  const isCustomPool = isNewCustomStatus || isSavedCustomStatus;
+  const isCustomPool = isLegacyCustomDraft || isSavedCustomStatus;
   const activeCustomLabel = isSavedCustomStatus
     ? labelFromCustomStatusSelect(sourceSelect)
     : customSourceStatus.trim();
   const sourceStatusLabel =
     SOURCE_OPTIONS.find((opt) => opt.value === sourceStatus)?.label ?? sourceStatus;
-  const sourceSelectDisplay = isNewCustomStatus
-    ? customSourceStatus.trim() || "+ Add new status"
-    : isSavedCustomStatus
-      ? activeCustomLabel
-      : sourceStatusLabel;
+  const sourceSelectDisplay = isNewMachinesMode
+    ? NEW_MACHINES_POOL_LABEL
+    : isLegacyCustomDraft
+      ? customSourceStatus.trim() || NEW_MACHINES_POOL_LABEL
+      : isSavedCustomStatus
+        ? activeCustomLabel
+        : sourceStatusLabel;
+
+  const categoryOptions = useMemo(() => {
+    const fromFleet = machines
+      .filter((m) => m.companyId === site.companyId)
+      .map((m) => m.category);
+    return Array.from(new Set([...MACHINERY_CATEGORIES, ...fromFleet])).sort((a, b) => a.localeCompare(b));
+  }, [machines, site.companyId]);
+
+  const finalCategory =
+    categorySelect === "__new__" ? customCategory.trim() : categorySelect.trim();
+  const resolvedUnitType = resolveMachineryUnitType(unitType, customUnitType);
 
   const includeMachineIds = isEditing && editDraft ? editDraft.machineIds : [];
 
   const eligibleMachines = useMemo(
     () =>
-      isCustomPool
+      isCustomPool || isNewMachinesMode
         ? []
         : getEligibleMachines(direction, sourceStatus, site.id, machines, includeMachineIds),
-    [direction, sourceStatus, site.id, machines, includeMachineIds, isCustomPool],
+    [direction, sourceStatus, site.id, machines, includeMachineIds, isCustomPool, isNewMachinesMode],
   );
 
   const machineryLines = useMemo(() => buildMachineryLines(eligibleMachines), [eligibleMachines]);
@@ -199,8 +235,9 @@ export function ManageMachineryDialog({
     [machineryLines, selectedLineKey],
   );
 
-  const maxQuantity = isCustomPool ? 0 : (selectedLine?.availableCount ?? 0);
-  const isPending = recordMutation.isPending || updateMutation.isPending;
+  const maxQuantity = isCustomPool || isNewMachinesMode ? 0 : (selectedLine?.availableCount ?? 0);
+  const isPending =
+    recordMutation.isPending || updateMutation.isPending || addMachineryMutation.isPending;
 
   useEffect(() => {
     if (!open) return;
@@ -209,15 +246,29 @@ export function ManageMachineryDialog({
       setDirection(editDraft.direction);
       if (editDraft.isCustomSource) {
         const label = editDraft.customSourceLabel.trim();
-        const saved = savedCustomStatuses.find((row) => row.label.toLowerCase() === label.toLowerCase());
-        if (saved) {
-          setSourceSelect(customStatusSelectValue(saved.label));
+        if (label.toLowerCase() === NEW_MACHINES_POOL_LABEL.toLowerCase()) {
+          setSourceSelect(NEW_MACHINES_SOURCE_VALUE);
           setCustomSourceStatus("");
+          setCustomMachineryName("");
+          const cat = editDraft.machineryLabel.trim();
+          if (categoryOptions.includes(cat)) {
+            setCategorySelect(cat);
+            setCustomCategory("");
+          } else if (cat) {
+            setCategorySelect("__new__");
+            setCustomCategory(cat);
+          }
         } else {
-          setSourceSelect(CUSTOM_MOVEMENT_SOURCE_VALUE);
-          setCustomSourceStatus(label);
+          const saved = savedCustomStatuses.find((row) => row.label.toLowerCase() === label.toLowerCase());
+          if (saved) {
+            setSourceSelect(customStatusSelectValue(saved.label));
+            setCustomSourceStatus("");
+          } else {
+            setSourceSelect(CUSTOM_MOVEMENT_SOURCE_VALUE);
+            setCustomSourceStatus(label);
+          }
+          setCustomMachineryName(editDraft.machineryLabel);
         }
-        setCustomMachineryName(editDraft.machineryLabel);
       } else {
         setSourceSelect(editDraft.sourceStatus);
         setSourceStatus(editDraft.sourceStatus);
@@ -240,31 +291,45 @@ export function ManageMachineryDialog({
     setGatePassNumber("");
     setSelectedLineKey("");
     setQuantity(1);
-  }, [open, editDraft, savedCustomStatuses]);
+    setCategorySelect("");
+    setCustomCategory("");
+    setUnitType(DEFAULT_MACHINERY_UNIT_TYPE);
+    setCustomUnitType("");
+  }, [open, editDraft, savedCustomStatuses, categoryOptions]);
 
   useEffect(() => {
-    if (!open || isEditing || isCustomPool) return;
+    if (!open || isEditing || isCustomPool || isNewMachinesMode) return;
     const next = direction === "out" ? "assigned" : "available";
     setSourceSelect(next);
     setSourceStatus(next);
-  }, [direction, open, isEditing, isCustomPool]);
+  }, [direction, open, isEditing, isCustomPool, isNewMachinesMode]);
 
   useEffect(() => {
     if (!open || isEditing) return;
-    if (isCustomPool) {
+    if (!isStoreToSite && isNewMachinesMode) {
+      setSourceSelect("assigned");
+      setSourceStatus("assigned");
+      setCategorySelect("");
+      setCustomCategory("");
+    }
+  }, [isStoreToSite, isNewMachinesMode, open, isEditing]);
+
+  useEffect(() => {
+    if (!open || isEditing) return;
+    if (isCustomPool || isNewMachinesMode) {
       setSelectedLineKey("");
       return;
     }
     setSelectedLineKey("");
     setQuantity(1);
-  }, [direction, sourceStatus, open, isEditing, isCustomPool]);
+  }, [direction, sourceStatus, open, isEditing, isCustomPool, isNewMachinesMode]);
 
   useEffect(() => {
-    if (isCustomPool || maxQuantity <= 0) return;
+    if (isCustomPool || isNewMachinesMode || maxQuantity <= 0) return;
     if (quantity > maxQuantity) {
       setQuantity(maxQuantity);
     }
-  }, [maxQuantity, quantity, isCustomPool]);
+  }, [maxQuantity, quantity, isCustomPool, isNewMachinesMode]);
 
   const resetAndClose = () => {
     setOpen(false);
@@ -273,9 +338,151 @@ export function ManageMachineryDialog({
     setCustomSourceStatus("");
     setCustomMachineryName("");
     setQuantity(1);
+    setCategorySelect("");
+    setCustomCategory("");
+    setUnitType(DEFAULT_MACHINERY_UNIT_TYPE);
+    setCustomUnitType("");
   };
 
   const handleSubmit = () => {
+    if (isNewMachinesMode) {
+      if (isEditing && originalSnapshot.current) {
+        const movementPayload = {
+          siteId: site.id,
+          siteName: site.name,
+          companyId: site.companyId,
+          direction,
+          sourceStatus: "assigned" as MachineryStatus,
+          customSourceStatus: NEW_MACHINES_POOL_LABEL,
+          movementDate,
+          gatePassNumber: gatePassNumber.trim() || undefined,
+          machineIds: originalSnapshot.current.machineIds,
+          machineryLabel: finalCategory || originalSnapshot.current.machineryLabel,
+          quantity,
+        };
+        updateMutation.mutate(
+          {
+            ...movementPayload,
+            ledgerEntryId: originalSnapshot.current.ledgerId,
+            original: {
+              direction: originalSnapshot.current.direction,
+              sourceStatus: originalSnapshot.current.sourceStatus,
+              customSourceStatus: NEW_MACHINES_POOL_LABEL,
+              machineIds: originalSnapshot.current.machineIds,
+            },
+          },
+          {
+            onSuccess: () => {
+              toast({ title: "Movement updated", description: `Record updated for ${site.name}.` });
+              resetAndClose();
+            },
+            onError: (err: Error) => {
+              toast({
+                title: "Could not update movement",
+                description: err.message,
+                variant: "destructive",
+              });
+            },
+          },
+        );
+        return;
+      }
+
+      if (!isStoreToSite) {
+        toast({
+          title: "OUT only",
+          description: "New machines can only be recorded when the store sends equipment to the site (OUT).",
+          variant: "destructive",
+        });
+        return;
+      }
+      if (!finalCategory) {
+        toast({ title: "Category required", description: "Select or enter a machinery category.", variant: "destructive" });
+        return;
+      }
+      if (!resolvedUnitType) {
+        toast({ title: "Unit type required", description: "Enter a unit type (e.g. nos, metre).", variant: "destructive" });
+        return;
+      }
+      if (quantity < 1) {
+        toast({ title: "Invalid quantity", description: "Enter a quantity of 1 or more.", variant: "destructive" });
+        return;
+      }
+
+      const reservedCodes = new Set(machines.map((m) => m.code.toUpperCase()));
+      const cursor = seedCategoryCodegen(finalCategory, machines, reservedCodes);
+      const generated = takeMachineryUnitsFromCursor(cursor, quantity, reservedCodes);
+      const units = generated.map((unit) => ({
+        ...unit,
+        projectName: site.name,
+        projectLocation: site.location,
+      }));
+
+      const displayLabel = movementDirectionDisplayLabel(direction);
+      const onSuccess = () => {
+        toast({
+          title: isEditing ? "Movement updated" : `Movement ${displayLabel} recorded`,
+          description: `${quantity} new ${finalCategory} unit(s) added to ${site.name}.`,
+        });
+        resetAndClose();
+      };
+      const onError = (err: Error) => {
+        toast({
+          title: isEditing ? "Could not update" : "Could not record movement",
+          description: err instanceof Error ? err.message : "Try again.",
+          variant: "destructive",
+        });
+      };
+
+      void (async () => {
+        try {
+          const { machineIds } = await addMachineryMutation.mutateAsync({
+            category: finalCategory,
+            status: "assigned",
+            assignedSiteId: site.id,
+            companyId: site.companyId,
+            unitType: resolvedUnitType,
+            units,
+          });
+
+          const movementPayload = {
+            siteId: site.id,
+            siteName: site.name,
+            companyId: site.companyId,
+            direction,
+            sourceStatus: "assigned" as MachineryStatus,
+            customSourceStatus: NEW_MACHINES_POOL_LABEL,
+            movementDate,
+            gatePassNumber: gatePassNumber.trim() || undefined,
+            machineIds,
+            machineryLabel: finalCategory,
+            quantity,
+          };
+
+          if (isEditing && originalSnapshot.current) {
+            await updateMutation.mutateAsync({
+              ...movementPayload,
+              ledgerEntryId: originalSnapshot.current.ledgerId,
+              original: {
+                direction: originalSnapshot.current.direction,
+                sourceStatus: originalSnapshot.current.sourceStatus,
+                customSourceStatus: originalSnapshot.current.isCustomSource
+                  ? originalSnapshot.current.customSourceLabel
+                  : undefined,
+                machineIds: originalSnapshot.current.machineIds,
+              },
+            });
+          } else {
+            await recordMutation.mutateAsync(movementPayload);
+          }
+          onSuccess();
+        } catch (err) {
+          onError(err instanceof Error ? err : new Error("Try again."));
+        }
+      })();
+      return;
+    }
+
     if (isCustomPool) {
       const statusLabel = activeCustomLabel;
       const machineryName = customMachineryName.trim();
@@ -483,11 +690,13 @@ export function ManageMachineryDialog({
             <Select
               value={sourceSelect}
               onValueChange={(v) => {
-                if (v === CUSTOM_MOVEMENT_SOURCE_VALUE) {
-                  setSourceSelect(CUSTOM_MOVEMENT_SOURCE_VALUE);
+                if (v === NEW_MACHINES_SOURCE_VALUE) {
+                  setSourceSelect(NEW_MACHINES_SOURCE_VALUE);
                   setCustomSourceStatus("");
                   setCustomMachineryName("");
                   setSelectedLineKey("");
+                  setCategorySelect("");
+                  setCustomCategory("");
                   return;
                 }
                 if (isSavedCustomStatusSelect(v)) {
@@ -495,6 +704,7 @@ export function ManageMachineryDialog({
                   setCustomSourceStatus("");
                   setCustomMachineryName("");
                   setSelectedLineKey("");
+                  setCategorySelect("");
                   return;
                 }
                 const next = v as MachineryStatus;
@@ -502,6 +712,7 @@ export function ManageMachineryDialog({
                 setSourceStatus(next);
                 setCustomSourceStatus("");
                 setCustomMachineryName("");
+                setCategorySelect("");
               }}
             >
               <SelectTrigger>
@@ -518,10 +729,15 @@ export function ManageMachineryDialog({
                     {row.label}
                   </SelectItem>
                 ))}
-                <SelectItem value={CUSTOM_MOVEMENT_SOURCE_VALUE}>+ Add new status</SelectItem>
+                {isStoreToSite ? (
+                  <SelectItem value={NEW_MACHINES_SOURCE_VALUE}>{NEW_MACHINES_POOL_LABEL}</SelectItem>
+                ) : null}
+                {isEditing && isLegacyCustomDraft ? (
+                  <SelectItem value={CUSTOM_MOVEMENT_SOURCE_VALUE}>Custom status (legacy)</SelectItem>
+                ) : null}
               </SelectContent>
             </Select>
-            {isNewCustomStatus ? (
+            {isLegacyCustomDraft && !isNewMachinesMode ? (
               <Input
                 placeholder="e.g. On rent, Subcontractor pool"
                 value={customSourceStatus}
@@ -530,11 +746,13 @@ export function ManageMachineryDialog({
               />
             ) : null}
             <p className="text-xs text-muted-foreground">
-              {isCustomPool
-                ? "Custom pool — saved for your company and reusable in this list."
-                : direction === "out"
-                  ? "Pool these units are leaving from at this site."
-                  : "Pool these units are arriving from (company pool or another site)."}
+              {isNewMachinesMode
+                ? "Store is sending new equipment to this site (not from available / assigned / maintenance stock)."
+                : isCustomPool
+                  ? "Custom pool — saved for your company and reusable in this list."
+                  : isStoreToSite
+                    ? "Units arriving from the store (company pool or another site)."
+                    : "Units returning from this site to the store."}
             </p>
           </MotionField>
 
@@ -551,7 +769,131 @@ export function ManageMachineryDialog({
             <p className="text-xs text-muted-foreground">Optional — recommended for gate and yard tracking.</p>
           </MotionField>
 
-          {isCustomPool ? (
+          {isNewMachinesMode ? (
+            <>
+              <MotionField label="Machinery type">
+                <Popover open={categoryPickerOpen} onOpenChange={setCategoryPickerOpen} modal={false}>
+                  <PopoverTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={categoryPickerOpen}
+                      className="w-full justify-between font-normal"
+                    >
+                      {finalCategory || "Search machinery category…"}
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="z-[100] w-[var(--radix-popover-trigger-width)] p-0" align="start">
+                    <Command>
+                      <CommandInput placeholder="Search category…" />
+                      <CommandList>
+                        <CommandEmpty>No category found.</CommandEmpty>
+                        <CommandGroup>
+                          {categoryOptions.map((category) => (
+                            <CommandItem
+                              key={category}
+                              value={category}
+                              onSelect={() => {
+                                setCategorySelect(category);
+                                setCustomCategory("");
+                                setCategoryPickerOpen(false);
+                              }}
+                            >
+                              <Check
+                                className={cn(
+                                  "mr-2 h-4 w-4",
+                                  categorySelect === category ? "opacity-100" : "opacity-0",
+                                )}
+                              />
+                              {category}
+                            </CommandItem>
+                          ))}
+                          <CommandItem
+                            value="__add_new_category__"
+                            onSelect={() => {
+                              setCategorySelect("__new__");
+                              setCategoryPickerOpen(false);
+                            }}
+                          >
+                            <Check
+                              className={cn(
+                                "mr-2 h-4 w-4",
+                                categorySelect === "__new__" ? "opacity-100" : "opacity-0",
+                              )}
+                            />
+                            + Add new category
+                          </CommandItem>
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+                {categorySelect === "__new__" ? (
+                  <Input
+                    className="mt-2"
+                    placeholder="e.g. Plasma Cutter"
+                    value={customCategory}
+                    onChange={(e) => setCustomCategory(e.target.value)}
+                    maxLength={120}
+                  />
+                ) : null}
+                <p className="text-xs text-muted-foreground">
+                  Categories match the Machinery overview tab — not individual units from stock pools.
+                </p>
+              </MotionField>
+
+              <MotionField label="Quantity & unit type">
+                <div className="flex overflow-hidden rounded-md border border-border bg-card focus-within:ring-2 focus-within:ring-ring/30">
+                  <Input
+                    type="number"
+                    min={1}
+                    className="min-w-0 flex-1 border-0 bg-transparent shadow-none focus-visible:ring-0"
+                    value={quantity}
+                    onChange={(e) => {
+                      const next = Number.parseInt(e.target.value, 10);
+                      if (Number.isFinite(next) && next >= 1) setQuantity(next);
+                    }}
+                  />
+                  <div className="flex shrink-0 items-stretch border-l border-border bg-muted/40">
+                    <Select
+                      value={unitType}
+                      onValueChange={(value) =>
+                        setUnitType(value as PresetMachineryUnitType | typeof CUSTOM_MACHINERY_UNIT_VALUE)
+                      }
+                    >
+                      <SelectTrigger className="h-auto min-w-[5.25rem] max-w-[7rem] gap-1 rounded-none border-0 bg-transparent px-2.5 py-2 text-sm shadow-none focus:ring-0">
+                        <SelectValue>
+                          {unitType === CUSTOM_MACHINERY_UNIT_VALUE
+                            ? customUnitType.trim() || "Custom"
+                            : unitType}
+                        </SelectValue>
+                      </SelectTrigger>
+                      <SelectContent position="popper" className="z-[120] max-h-72">
+                        {MACHINERY_UNIT_TYPE_OPTIONS.map((opt) => (
+                          <SelectItem key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </SelectItem>
+                        ))}
+                        <SelectItem value={CUSTOM_MACHINERY_UNIT_VALUE}>Custom…</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                {unitType === CUSTOM_MACHINERY_UNIT_VALUE ? (
+                  <Input
+                    className="mt-2"
+                    placeholder="e.g. tonne, sqm, bundle"
+                    value={customUnitType}
+                    onChange={(e) => setCustomUnitType(e.target.value)}
+                    maxLength={24}
+                  />
+                ) : null}
+                <p className="text-xs text-muted-foreground">No quantity cap — new purchases from market.</p>
+              </MotionField>
+            </>
+          ) : isCustomPool ? (
             <MotionField label="Machinery name">
               <Input
                 placeholder="e.g. ALLU. LADDER 6MTR"
@@ -616,26 +958,28 @@ export function ManageMachineryDialog({
             </MotionField>
           )}
 
-          <MotionField label="Quantity">
-            <Input
-              type="number"
-              min={1}
-              max={isCustomPool ? undefined : maxQuantity || 1}
-              value={quantity}
-              disabled={!isCustomPool && !selectedLine}
-              onChange={(e) => {
-                const next = Number.parseInt(e.target.value, 10);
-                if (Number.isFinite(next) && next >= 1) setQuantity(next);
-              }}
-            />
-            {isCustomPool ? (
-              <p className="text-xs text-muted-foreground">No limit for custom status — enter any quantity.</p>
-            ) : selectedLine ? (
-              <p className="text-xs text-muted-foreground">
-                {maxQuantity} unit{maxQuantity === 1 ? "" : "s"} available in this pool.
-              </p>
-            ) : null}
-          </MotionField>
+          {!isNewMachinesMode ? (
+            <MotionField label="Quantity">
+              <Input
+                type="number"
+                min={1}
+                max={isCustomPool ? undefined : maxQuantity || 1}
+                value={quantity}
+                disabled={!isCustomPool && !selectedLine}
+                onChange={(e) => {
+                  const next = Number.parseInt(e.target.value, 10);
+                  if (Number.isFinite(next) && next >= 1) setQuantity(next);
+                }}
+              />
+              {isCustomPool ? (
+                <p className="text-xs text-muted-foreground">No limit for custom status — enter any quantity.</p>
+              ) : selectedLine ? (
+                <p className="text-xs text-muted-foreground">
+                  {maxQuantity} unit{maxQuantity === 1 ? "" : "s"} available in this pool.
+                </p>
+              ) : null}
+            </MotionField>
+          ) : null}
         </div>
 
         <DialogFooter className="gap-2 sm:gap-0">
@@ -647,9 +991,11 @@ export function ManageMachineryDialog({
             onClick={handleSubmit}
             disabled={
               isPending ||
-              (isCustomPool
-                ? !activeCustomLabel || !customMachineryName.trim()
-                : !selectedLine)
+              (isNewMachinesMode
+                ? !finalCategory || !resolvedUnitType || quantity < 1
+                : isCustomPool
+                  ? !activeCustomLabel || !customMachineryName.trim()
+                  : !selectedLine)
             }
             className={cn(
               direction === "in"

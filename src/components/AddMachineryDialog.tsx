@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "@/hooks/use-toast";
 import {
@@ -35,10 +36,21 @@ import {
   type PresetMachineryUnitType,
 } from "@/lib/machinery-unit-types";
 import {
-  seedCategoryCodegen,
-  takeMachineryUnitsFromCursor,
-  type MachineryCodegenCursor,
-} from "@/lib/machinery-unit-codegen";
+  assertBulkImportCodesAreNew,
+  buildBulkSiteResolutionsAndQueue,
+  bulkGroupParsedRows,
+  bulkGroupsToTemplatePreviewRows,
+  bulkValidationUniqueCodes,
+  MACHINERY_BULK_SAMPLE_CSV,
+  parseBulkStructural,
+  siteAssignmentKey,
+  siteDeploymentExists,
+  siteNameTakenForCompany,
+  type BulkParsedRow,
+  type BulkPreviewGroup,
+  type BulkSiteConfirmItem,
+  type BulkSiteResolution,
+} from "@/lib/machinery-bulk-upload";
 
 type Props = {
   buttonText?: string;
@@ -55,40 +67,7 @@ function resolveMachineryCompanyId(
   return user.companyId;
 }
 
-type BulkPreviewGroup = {
-  category: string;
-  status: MachineryStatus;
-  assignedSiteId: string | null;
-  siteName: string;
-  unitType: MachineryUnitType;
-  /** Units already in the system for this category/status/site/unit before this import. */
-  existingUnitCount: number;
-  units: Array<{
-    code: string;
-    name: string;
-    projectName: string;
-    projectLocation: string;
-  }>;
-};
-
-type BulkParsedRow = {
-  category: string;
-  status: MachineryStatus;
-  projectName: string;
-  projectLocation: string;
-  unitType: MachineryUnitType;
-  code: string;
-  name: string;
-};
-
-type ResolvedBulkSite = { siteId: string; displayName: string };
-
-type BulkSiteConfirmItem = {
-  key: string;
-  csvProjectName: string;
-  csvLocation: string;
-  existingSite: Site | null;
-};
+type ResolvedBulkSite = BulkSiteResolution;
 
 type BulkWizardUi = {
   mode: "case1-choice" | "case1-edit" | "case2-choice" | "case2-enterNew";
@@ -104,295 +83,11 @@ type BulkWizardState = {
   ui: BulkWizardUi;
 };
 
-function normBulkCompareKey(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/[\u2013\u2014\u2212]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function siteAssignmentKey(projectName: string, projectLocation: string) {
-  return `${normBulkCompareKey(projectName)}|${normBulkCompareKey(projectLocation)}`;
-}
-
-function bulkMachineryInventoryKey(
-  category: string,
-  status: MachineryStatus,
-  unitType: MachineryUnitType,
-  projectName: string,
-  projectLocation: string,
-) {
-  const sitePart = status === "assigned" ? siteAssignmentKey(projectName, projectLocation) : "";
-  return `${normBulkCompareKey(category)}|${status}|${unitType}|${sitePart}`;
-}
-
-function machineMatchesBulkInventory(
-  machine: Machine,
-  sites: Site[],
-  companyId: string | null,
-  category: string,
-  status: MachineryStatus,
-  unitType: MachineryUnitType,
-  projectName: string,
-  projectLocation: string,
-): boolean {
-  if (companyId && machine.companyId !== companyId) return false;
-  if (normBulkCompareKey(machine.category) !== normBulkCompareKey(category)) return false;
-  if (machine.status !== status) return false;
-  if (machine.unitType !== unitType) return false;
-
-  if (status === "assigned") {
-    const matchedSite = findBulkSiteMatch(sites, projectName, projectLocation);
-    if (matchedSite && machine.assignedSiteId === matchedSite.id) return true;
-  }
-
-  const targetKey = bulkMachineryInventoryKey(category, status, unitType, projectName, projectLocation);
-  const machineKey = bulkMachineryInventoryKey(
-    machine.category,
-    machine.status,
-    machine.unitType,
-    machine.projectName ?? "",
-    machine.projectLocation ?? "",
-  );
-  return machineKey === targetKey;
-}
-
-function countExistingBulkMachinery(
-  machines: Machine[],
-  sites: Site[],
-  companyId: string | null,
-  category: string,
-  status: MachineryStatus,
-  unitType: MachineryUnitType,
-  projectName: string,
-  projectLocation: string,
-): number {
-  return machines.filter((machine) =>
-    machineMatchesBulkInventory(machine, sites, companyId, category, status, unitType, projectName, projectLocation),
-  ).length;
-}
-
-/** CSV qty is added to existing inventory (e.g. 15 existing + 5 in file → create 5 new units). */
-function bulkUnitsToCreate(csvQty: number): number {
-  return csvQty <= 0 ? 0 : csvQty;
-}
-
-function findBulkSiteMatch(sitesForForm: Site[], projectName: string, projectLocation: string): Site | null {
-  const nameKey = normBulkCompareKey(projectName);
-  const locKey = normBulkCompareKey(projectLocation);
-  return (
-    sitesForForm.find((site) => {
-      const sn = normBulkCompareKey(site.name);
-      const sl = normBulkCompareKey(site.location);
-      return (
-        sn === nameKey ||
-        (sn.includes(nameKey) && sl.includes(locKey)) ||
-        (`${sn} ${sl}`.includes(nameKey) && sl.includes(locKey))
-      );
-    }) ?? null
-  );
-}
-
-function bulkValidationUniqueCodes(rows: BulkParsedRow[], machines: Machine[]): string | null {
-  const uploadedCodes = rows.map((row) => row.code.toUpperCase());
-  if (new Set(uploadedCodes).size !== uploadedCodes.length) {
-    return "Each machinery code in the file must be unique (duplicate in upload).";
-  }
-  const existingCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
-  const duplicateExisting = uploadedCodes.find((code) => existingCodes.has(code));
-  if (duplicateExisting) return `Code ${duplicateExisting} already exists in the system.`;
-  return null;
-}
-
-type BulkCsvLineSpec = {
-  projectName: string;
-  projectLocation: string;
-  category: string;
-  status: MachineryStatus;
-  unitType: MachineryUnitType;
-  qty: number;
-};
-
-function parseBulkStructural(
-  csvInput: string,
-  machines: Machine[],
-  sites: Site[],
-  companyId: string | null,
-): { ok: true; rows: BulkParsedRow[] } | { ok: false; error: string } {
-  const lines = csvInput
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .filter((line) => !line.toLowerCase().startsWith("projectname,"));
-  if (lines.length === 0) {
-    return { ok: false, error: "No data rows found. Upload a CSV or use sample data." };
-  }
-  try {
-    const reservedCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
-    const categoryCursors = new Map<string, MachineryCodegenCursor>();
-    const parsedRows: BulkParsedRow[] = [];
-    const aggregated = new Map<string, BulkCsvLineSpec>();
-
-    lines.forEach((line, index) => {
-      const cells = parseCsvLine(line);
-      if (cells.length !== 6) {
-        throw new Error(`Row ${index + 1}: expected 6 columns (projectName, location, category, qty, unit_type, status).`);
-      }
-
-      const [projectNameRaw, projectLocationRaw, categoryRaw, qtyRaw, unitTypeRaw, statusRaw] = cells;
-      const projectName = projectNameRaw.trim();
-      const projectLocation = projectLocationRaw.trim();
-      const category = categoryRaw.trim();
-      const qty = Number.parseInt(qtyRaw.trim(), 10);
-      const unitTypeLabel = unitTypeRaw.trim();
-      if (!projectName) throw new Error(`Row ${index + 1}: project name is required.`);
-      if (!projectLocation) throw new Error(`Row ${index + 1}: location is required.`);
-      if (!category) throw new Error(`Row ${index + 1}: category is required.`);
-      if (!Number.isFinite(qty) || qty < 0) {
-        throw new Error(`Row ${index + 1}: qty must be a whole number of 0 or more.`);
-      }
-      if (!unitTypeLabel) throw new Error(`Row ${index + 1}: unit_type is required (e.g. nos, metre).`);
-
-      const status = parseBulkStatus(statusRaw);
-      if (!status) throw new Error(`Row ${index + 1}: invalid status "${statusRaw}".`);
-
-      const unitType = normalizeMachineryUnitType(unitTypeLabel);
-      const invKey = bulkMachineryInventoryKey(category, status, unitType, projectName, projectLocation);
-      const prev = aggregated.get(invKey);
-      if (prev) prev.qty += qty;
-      else {
-        aggregated.set(invKey, { projectName, projectLocation, category, status, unitType, qty });
-      }
-    });
-
-    aggregated.forEach((spec) => {
-      const unitsToAdd = bulkUnitsToCreate(spec.qty);
-      if (unitsToAdd === 0) return;
-
-      const categoryKey = spec.category.toLowerCase();
-      let cursor = categoryCursors.get(categoryKey);
-      if (!cursor) {
-        cursor = seedCategoryCodegen(spec.category, machines, reservedCodes);
-        categoryCursors.set(categoryKey, cursor);
-      }
-
-      const generated = takeMachineryUnitsFromCursor(cursor, unitsToAdd, reservedCodes);
-      generated.forEach((unit) => {
-        parsedRows.push({
-          category: spec.category,
-          status: spec.status,
-          projectName: spec.projectName,
-          projectLocation: spec.projectLocation,
-          unitType: spec.unitType,
-          code: unit.code,
-          name: unit.name,
-        });
-      });
-    });
-
-    return { ok: true, rows: parsedRows };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "Check CSV and try again.",
-    };
-  }
-}
-
-function bulkSiteConfirmQueue(rows: BulkParsedRow[], sitesForForm: Site[]): BulkSiteConfirmItem[] {
-  const seen = new Set<string>();
-  const queue: BulkSiteConfirmItem[] = [];
-
-  rows.forEach((row) => {
-    if (row.status !== "assigned") return;
-    const key = siteAssignmentKey(row.projectName, row.projectLocation);
-    if (seen.has(key)) return;
-    seen.add(key);
-    queue.push({
-      key,
-      csvProjectName: row.projectName,
-      csvLocation: row.projectLocation,
-      existingSite: findBulkSiteMatch(sitesForForm, row.projectName, row.projectLocation),
-    });
-  });
-
-  return queue;
-}
-
-function bulkGroupParsedRows(
-  rows: BulkParsedRow[],
-  resolutions: Record<string, ResolvedBulkSite>,
-  machines: Machine[],
-  sites: Site[],
-  companyId: string | null,
-): BulkPreviewGroup[] {
-  const grouped = new Map<string, BulkPreviewGroup>();
-
-  rows.forEach((row) => {
-    let assignedSiteId: string | null = null;
-    let siteName = "—";
-    if (row.status === "assigned") {
-      const rk = siteAssignmentKey(row.projectName, row.projectLocation);
-      const res = resolutions[rk];
-      if (!res) {
-        throw new Error(`Missing site resolution for "${row.projectName}" at "${row.projectLocation}".`);
-      }
-      assignedSiteId = res.siteId;
-      siteName = res.displayName;
-    }
-
-    const groupKey = `${row.category}__${row.status}__${assignedSiteId ?? "none"}__${row.unitType}`;
-    const existing = grouped.get(groupKey);
-    const unit = {
-      code: row.code,
-      name: row.name,
-      projectName: row.projectName,
-      projectLocation: row.projectLocation,
-    };
-    if (existing) existing.units.push(unit);
-    else {
-      grouped.set(groupKey, {
-        category: row.category,
-        status: row.status,
-        assignedSiteId,
-        siteName,
-        unitType: row.unitType,
-        existingUnitCount: countExistingBulkMachinery(
-          machines,
-          sites,
-          companyId,
-          row.category,
-          row.status,
-          row.unitType,
-          row.projectName,
-          row.projectLocation,
-        ),
-        units: [unit],
-      });
-    }
-  });
-
-  return Array.from(grouped.values());
-}
-
 function wizardUiSeed(item: BulkSiteConfirmItem): BulkWizardUi {
   if (item.existingSite) {
     return { mode: "case2-choice", nameDraft: item.csvProjectName.trim() };
   }
   return { mode: "case1-choice", nameDraft: item.csvProjectName.trim() };
-}
-
-function siteNameTakenForCompany(
-  name: string,
-  companyId: string,
-  allSites: Site[],
-  normalizedPending: ReadonlySet<string>,
-): boolean {
-  const nk = normBulkCompareKey(name);
-  if (!name.trim()) return true;
-  if (normalizedPending.has(nk)) return true;
-  return allSites.some((site) => site.companyId === companyId && normBulkCompareKey(site.name) === nk);
 }
 
 export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
@@ -414,6 +109,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   const [bulkFileName, setBulkFileName] = useState("");
   /** Parsed bulk rows grouped for addMachinery; shown in preview until user confirms. */
   const [bulkPreview, setBulkPreview] = useState<BulkPreviewGroup[] | null>(null);
+  const [bulkImporting, setBulkImporting] = useState(false);
+  const [bulkImportProgress, setBulkImportProgress] = useState(0);
   /** Sequential site confirmations before preview opens (assigned rows only). */
   const [bulkWizard, setBulkWizard] = useState<BulkWizardState | null>(null);
   const bulkWizardRef = useRef<BulkWizardState | null>(null);
@@ -428,6 +125,11 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     unitType: DEFAULT_MACHINERY_UNIT_TYPE as PresetMachineryUnitType | typeof CUSTOM_MACHINERY_UNIT_VALUE,
     customUnitType: "",
   });
+
+  const bulkOwnerCompanyId = useMemo(
+    () => (user.role === "super_admin" ? poolCompanyId : user.companyId) || null,
+    [user.role, user.companyId, poolCompanyId],
+  );
 
   /** Sites that can receive newly assigned machinery (Super Admin: match selected company). */
   const sitesForAssignment = useMemo(() => {
@@ -549,6 +251,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     setBulkFileName("");
     setBulkPreview(null);
     setBulkWizard(null);
+    setBulkImporting(false);
+    setBulkImportProgress(0);
     setMode("single");
   };
 
@@ -644,12 +348,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       const ownerCompanyId = user.role === "super_admin" ? poolCompanyId : user.companyId;
       if (nextIndex >= wiz.queue.length) {
         try {
-          const groups = bulkGroupParsedRows(wiz.stagingRows, resolutions, machines, sitesForForm, ownerCompanyId || null);
+          const groups = bulkGroupParsedRows(wiz.stagingRows, resolutions, machines, ownerCompanyId || null);
           setBulkPreview(groups);
           const total = groups.reduce((sum, g) => sum + g.units.length, 0);
           toast({
             title: "Preview ready",
-            description: `Site setup finished (${wiz.queue.length} site${wiz.queue.length !== 1 ? "s" : ""}). Review ${total} new unit(s) in ${groups.length} group(s) below, then confirm.`,
+            description: `Site setup finished (${wiz.queue.length} site${wiz.queue.length !== 1 ? "s" : ""}). Review ${total} new unit(s) to add — existing machinery is unchanged.`,
           });
         } catch (err) {
           toast({
@@ -668,12 +372,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         ui: wizardUiSeed(wiz.queue[nextIndex]),
       };
     },
-    [machines, poolCompanyId, sitesForForm, user.companyId, user.role],
+    [machines, poolCompanyId, user.companyId, user.role],
   );
 
   const onBulkPreview = (csvInput = bulkCsv) => {
-    const ownerCompanyId = user.role === "super_admin" ? poolCompanyId : user.companyId;
-    const structured = parseBulkStructural(csvInput, machines, sitesForForm, ownerCompanyId || null);
+    const ownerCompanyId = bulkOwnerCompanyId;
+    const structured = parseBulkStructural(csvInput, machines, ownerCompanyId);
     if (!structured.ok) {
       toast({ title: "Could not parse CSV", description: structured.error, variant: "destructive" });
       return;
@@ -707,16 +411,20 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       return;
     }
 
-    const queue = bulkSiteConfirmQueue(structured.rows, sitesForForm);
+    const { resolutions, queue } = buildBulkSiteResolutionsAndQueue(structured.rows, sites, ownerCompanyId);
 
     if (queue.length === 0) {
       try {
-        const groups = bulkGroupParsedRows(structured.rows, {}, machines, sitesForForm, ownerCompanyId || null);
+        const groups = bulkGroupParsedRows(structured.rows, resolutions, machines, ownerCompanyId);
         const total = groups.reduce((sum, g) => sum + g.units.length, 0);
         setBulkPreview(groups);
+        const autoMatched = Object.keys(resolutions).length;
         toast({
           title: "Preview ready",
-          description: `Review ${total} new unit(s) in ${groups.length} group(s) below, then confirm.`,
+          description:
+            autoMatched > 0
+              ? `Review ${total} new unit(s) to add (${autoMatched} existing site${autoMatched !== 1 ? "s" : ""} matched automatically). Existing machinery is unchanged.`
+              : `Review ${total} new unit(s) in the table, then confirm.`,
         });
       } catch (err) {
         toast({
@@ -732,23 +440,48 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       queue,
       index: 0,
       stagingRows: structured.rows,
-      resolutions: {},
+      resolutions,
       pendingNormNames: new Set(),
       ui: wizardUiSeed(queue[0]),
     });
+    const autoMatched = Object.keys(resolutions).length;
     toast({
       title: "Site confirmation",
-      description: `${queue.length} site${queue.length !== 1 ? "s need" : " needs"} your choice before preview (step 1 of ${queue.length}).`,
+      description:
+        autoMatched > 0
+          ? `${queue.length} site${queue.length !== 1 ? "s need" : " needs"} your choice (${autoMatched} already matched). Step 1 of ${queue.length}.`
+          : `${queue.length} site${queue.length !== 1 ? "s need" : " needs"} your choice before preview (step 1 of ${queue.length}).`,
     });
   };
 
   const onBulkConfirm = () => {
-    if (!bulkPreview || bulkPreview.length === 0) return;
-    const total = bulkPreview.reduce((sum, g) => sum + g.units.length, 0);
+    if (!bulkPreview || bulkPreview.length === 0 || bulkImporting) return;
+
+    const groups = bulkPreview;
+    const total = groups.reduce((sum, g) => sum + g.units.length, 0);
+    const groupCount = groups.length;
+
+    setBulkImporting(true);
+    setBulkImportProgress(8);
+
     void (async () => {
       try {
+        const flatRows = groups.flatMap((group) =>
+          group.units.map((unit) => ({
+            category: group.category,
+            status: group.status,
+            projectName: unit.projectName,
+            projectLocation: unit.projectLocation,
+            unitType: group.unitType,
+            code: unit.code,
+            name: unit.name,
+          })),
+        );
+        assertBulkImportCodesAreNew(flatRows, machines);
+
         let ledgerCompanyId: string | null = null;
-        for (const group of bulkPreview) {
+        for (let i = 0; i < groups.length; i++) {
+          const group = groups[i];
           const { siteName: _s, ...payload } = group;
           const companyId = resolveMachineryCompanyId(user, sites, payload.assignedSiteId, user.role === "super_admin" ? poolCompanyId : null);
           if (!companyId) throw new Error("Missing company context for bulk row.");
@@ -762,6 +495,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
             units: payload.units,
             ledgerImportTag: "bulk_csv",
           });
+          setBulkImportProgress(Math.round(((i + 1) / groupCount) * 100));
         }
 
         if (ledgerCompanyId) {
@@ -769,7 +503,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
             await appendAuditLedgerEntry({
               companyId: ledgerCompanyId,
               eventKind: "bulk_upload_completed",
-              summary: `Bulk machinery CSV import finished: ${total} unit(s) across ${bulkPreview.length} row group(s).`,
+              summary: `Bulk machinery CSV import finished: ${total} unit(s) across ${groups.length} row group(s).`,
               siteId: null,
               machineIds: [],
               requester: user.name ?? "System",
@@ -782,8 +516,10 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
           }
         }
 
-        void queryClient.invalidateQueries({ queryKey: operationalKeys.all });
-        toast({ title: "Bulk upload complete", description: `${total} machinery unit(s) added to the system.` });
+        toast({
+          title: "Bulk upload complete",
+          description: `${total} new machinery unit(s) added. Existing sites and assignments were not changed.`,
+        });
         setOpen(false);
         resetForm();
       } catch (err) {
@@ -792,6 +528,9 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
           description: err instanceof Error ? err.message : "Try again.",
           variant: "destructive",
         });
+      } finally {
+        setBulkImporting(false);
+        setBulkImportProgress(0);
       }
     })();
   };
@@ -834,7 +573,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   };
 
   const downloadSampleTemplate = () => {
-    const blob = new Blob([SAMPLE_BULK_CSV], { type: "text/csv;charset=utf-8;" });
+    const blob = new Blob([MACHINERY_BULK_SAMPLE_CSV], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -909,11 +648,14 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       return;
     }
 
-    if (siteNameTakenForCompany(trimmed, ownerCompanyId, sites, wiz.pendingNormNames)) {
+    const location = item.csvLocation.trim();
+    if (
+      siteDeploymentExists(sites, trimmed, location, ownerCompanyId, wiz.pendingNormNames) ||
+      siteNameTakenForCompany(trimmed, ownerCompanyId, sites, wiz.pendingNormNames)
+    ) {
       toast({
-        title: "Site name already in use",
-        description:
-          `Use a unique site name within this company. "${trimmed}" matches an existing or pending site in this upload.`,
+        title: "Site already exists",
+        description: `"${trimmed}" at "${location}" is already in your directory. Choose "Use existing site" to add machinery there, or enter a different site name.`,
         variant: "destructive",
       });
       return;
@@ -931,7 +673,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         createdDuringBulkUpload: true,
       });
       const nextPending = new Set(wiz.pendingNormNames);
-      nextPending.add(normBulkCompareKey(trimmed));
+      nextPending.add(siteAssignmentKey(trimmed, location));
 
       setBulkWizard((prev) => {
         if (!prev || prev.index !== markerIdx || prev.queue[prev.index]?.key !== markerKey) return prev;
@@ -951,6 +693,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
+        if (!nextOpen && bulkImporting) return;
         setOpen(nextOpen);
         if (!nextOpen) resetForm();
       }}
@@ -1230,43 +973,49 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   Review import (+{bulkPreview.reduce((n, g) => n + g.units.length, 0)} new unit
                   {bulkPreview.reduce((n, g) => n + g.units.length, 0) === 1 ? "" : "s"})
                 </p>
-                <ul className="space-y-1 text-xs text-muted-foreground">
-                  {bulkPreview.map((group) => (
-                    <li key={`${group.category}-${group.status}-${group.assignedSiteId ?? "pool"}-${group.unitType}`}>
-                      <span className="font-medium text-foreground">{group.category}</span> ({group.status}
-                      {group.status === "assigned" ? ` · ${group.siteName}` : ""}): {group.existingUnitCount} existing +{" "}
-                      {group.units.length} new = {group.existingUnitCount + group.units.length} total
-                    </li>
-                  ))}
-                </ul>
-                <p className="text-xs text-muted-foreground">Nothing is saved until you confirm. Use Back to file to pick another file and preview again.</p>
+                <p className="text-xs text-muted-foreground">
+                  Nothing is saved until you confirm. Import only <span className="font-semibold text-foreground">adds</span> new units —
+                  existing machinery and site assignments are never removed or reset.
+                </p>
+                {bulkImporting ? (
+                  <div className="space-y-2 rounded-md border border-border bg-muted/40 p-3">
+                    <p className="text-sm font-medium">Uploading machinery…</p>
+                    <p className="text-xs text-muted-foreground">
+                      Your import is confirmed. The system is adding {bulkPreview.reduce((n, g) => n + g.units.length, 0)} unit
+                      {bulkPreview.reduce((n, g) => n + g.units.length, 0) === 1 ? "" : "s"} in the background — please keep this window open.
+                    </p>
+                    <Progress value={bulkImportProgress} className="h-2" />
+                    <p className="text-right text-xs tabular-nums text-muted-foreground">{bulkImportProgress}%</p>
+                  </div>
+                ) : null}
                 <div className="max-h-72 overflow-auto rounded-md border border-border">
-                  <table className="min-w-[900px] text-xs">
+                  <table className="min-w-[720px] text-xs">
                     <thead className="sticky top-0 border-b border-border bg-secondary/60 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
                       <tr>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Category</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Unit</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Status</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Project</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Location</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Code</th>
-                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Name</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">projectName</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">location</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">category</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">qty</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">unit_type</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">status</th>
+                        <th className="px-2 py-1.5 font-medium whitespace-nowrap">Site</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {bulkPreview.flatMap((group) =>
-                        group.units.map((unit) => (
-                          <tr key={`${group.category}-${unit.code}`} className="border-b border-border/80 last:border-0">
-                            <td className="px-2 py-1.5 align-top whitespace-nowrap">{group.category}</td>
-                            <td className="px-2 py-1.5 align-top whitespace-nowrap">{group.unitType}</td>
-                            <td className="px-2 py-1.5 align-top capitalize whitespace-nowrap">{group.status}</td>
-                            <td className="px-2 py-1.5 align-top">{unit.projectName}</td>
-                            <td className="px-2 py-1.5 align-top whitespace-nowrap">{unit.projectLocation}</td>
-                            <td className="px-2 py-1.5 font-mono align-top text-left whitespace-nowrap">{unit.code}</td>
-                            <td className="px-2 py-1.5 align-top">{unit.name}</td>
-                          </tr>
-                        )),
-                      )}
+                      {bulkGroupsToTemplatePreviewRows(bulkPreview).map((row) => (
+                        <tr
+                          key={`${row.projectName}-${row.location}-${row.category}-${row.status}-${row.unitType}`}
+                          className="border-b border-border/80 last:border-0"
+                        >
+                          <td className="px-2 py-1.5 align-top">{row.projectName}</td>
+                          <td className="px-2 py-1.5 align-top whitespace-nowrap">{row.location}</td>
+                          <td className="px-2 py-1.5 align-top whitespace-nowrap">{row.category}</td>
+                          <td className="px-2 py-1.5 align-top tabular-nums">{row.qty}</td>
+                          <td className="px-2 py-1.5 align-top whitespace-nowrap">{row.unitType}</td>
+                          <td className="px-2 py-1.5 align-top capitalize whitespace-nowrap">{row.status}</td>
+                          <td className="px-2 py-1.5 align-top text-muted-foreground">{row.siteName ?? "—"}</td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>
@@ -1277,9 +1026,9 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   <button
                     type="button"
                     onClick={() => {
-                      setBulkCsv(SAMPLE_BULK_CSV);
+                      setBulkCsv(MACHINERY_BULK_SAMPLE_CSV);
                       setBulkFileName("sample-bulk-data.csv");
-                      onBulkPreview(SAMPLE_BULK_CSV);
+                      onBulkPreview(MACHINERY_BULK_SAMPLE_CSV);
                     }}
                     className="text-sm font-medium text-blue-600 underline-offset-2 hover:underline dark:text-sky-400"
                   >
@@ -1351,14 +1100,14 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         <DialogFooter>
           {mode === "bulk" && bulkPreview ? (
             <>
-              <Button type="button" variant="outline" onClick={() => setBulkPreview(null)}>
+              <Button type="button" variant="outline" disabled={bulkImporting} onClick={() => setBulkPreview(null)}>
                 Back to file
               </Button>
-              <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+              <Button type="button" variant="outline" disabled={bulkImporting} onClick={() => setOpen(false)}>
                 Cancel
               </Button>
-              <Button type="button" onClick={onBulkConfirm}>
-                Confirm & import
+              <Button type="button" onClick={onBulkConfirm} disabled={bulkImporting}>
+                {bulkImporting ? "Importing…" : "Confirm & import"}
               </Button>
             </>
           ) : (
@@ -1413,16 +1162,25 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
               {bulkWizardStepItem.existingSite && bulkWizard.ui.mode === "case2-choice" ? (
                 <AlertDialogDescription asChild>
                   <div className="space-y-2 text-muted-foreground">
-                    <p>A site with this name already exists for this mapping.</p>
+                    <p>A site with this name already exists in your company.</p>
                     <p>
                       Matched site:{' '}
                       <span className="font-semibold text-foreground">{bulkWizardStepItem.existingSite.name}</span> (
                       {bulkWizardStepItem.existingSite.location}).
                     </p>
-                    <p>
-                      Add these machinery rows under that existing site, or enter a different name to create another site (&quot;
-                      {bulkWizardStepItem.csvProjectName}&quot; at &quot;{bulkWizardStepItem.csvLocation}&quot;).
-                    </p>
+                    {bulkWizardStepItem.locationMismatch ? (
+                      <p>
+                        Your CSV location (&quot;{bulkWizardStepItem.csvLocation}&quot;) differs from the site record. Using the
+                        existing site will <span className="font-semibold text-foreground">add</span> new machinery there and keep
+                        all machinery already on that site.
+                      </p>
+                    ) : (
+                      <p>
+                        <span className="font-semibold text-foreground">Use existing site</span> to add new units from your CSV.
+                        Machinery already on that site stays as-is.
+                      </p>
+                    )}
+                    <p>Or enter a different name to create a separate site for &quot;{bulkWizardStepItem.csvProjectName}&quot;.</p>
                   </div>
                 </AlertDialogDescription>
               ) : null}
@@ -1517,48 +1275,5 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     </AlertDialog>
     </>
   );
-};
-
-const SAMPLE_BULK_CSV = [
-  "projectName,location,category,qty,unit_type,status",
-  "UPL Limited — Panoli,\"Panoli, Gujarat\",Grinding Machine,2,nos,assigned",
-  "L&T Heavy Engineering — Hazira,\"Hazira, Gujarat\",Lathe Machine,1,nos,available",
-  "SRF Limited — Dahej,\"Dahej, Gujarat\",Compressor Unit,1,nos,maintenance",
-  "SRF Limited — Dahej,\"Dahej, Gujarat\",Welding Machine,3,metre,assigned",
-].join("\n");
-
-const parseBulkStatus = (value: string): MachineryStatus | null => {
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "assigned" || normalized === "maintenance" || normalized === "available") {
-    return normalized;
-  }
-  return null;
-};
-
-const parseCsvLine = (line: string) => {
-  const cells: string[] = [];
-  let current = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i];
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i += 1;
-      } else {
-        inQuotes = !inQuotes;
-      }
-      continue;
-    }
-    if (char === "," && !inQuotes) {
-      cells.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  cells.push(current.trim());
-  return cells;
 };
 
