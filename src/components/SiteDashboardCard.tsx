@@ -25,6 +25,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useDeleteSiteMutation, useUpdateSiteMutation } from "@/hooks/useOperationalData";
+import { canUpdateSite } from "@/lib/rbac";
 import { useScopedMachines, useScopedSites } from "@/hooks/useCompanyScope";
 import { SiteFinishWorkflowDialog } from "@/components/SiteFinishWorkflowDialog";
 import { supabase, isSupabaseConfigured } from "@/lib/supabaseClient";
@@ -75,8 +76,7 @@ export function SiteDashboardCard({ site, machineryCount, deploymentPercent, clo
   const updateSite = useUpdateSiteMutation();
   const deleteSite = useDeleteSiteMutation();
 
-  const canUpdate =
-    user.role === "super_admin" || user.role === "firm_admin" || user.role === "senior_manager";
+  const canUpdate = canUpdateSite(user.role);
   const canDelete = user.role === "super_admin" || user.role === "firm_admin";
 
   const canPickTeamProfiles = user.role === "super_admin" || user.role === "firm_admin";

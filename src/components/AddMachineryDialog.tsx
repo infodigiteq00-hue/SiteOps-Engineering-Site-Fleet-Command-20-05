@@ -61,6 +61,8 @@ type BulkPreviewGroup = {
   assignedSiteId: string | null;
   siteName: string;
   unitType: MachineryUnitType;
+  /** Units already in the system for this category/status/site/unit before this import. */
+  existingUnitCount: number;
   units: Array<{
     code: string;
     name: string;
@@ -114,6 +116,68 @@ function siteAssignmentKey(projectName: string, projectLocation: string) {
   return `${normBulkCompareKey(projectName)}|${normBulkCompareKey(projectLocation)}`;
 }
 
+function bulkMachineryInventoryKey(
+  category: string,
+  status: MachineryStatus,
+  unitType: MachineryUnitType,
+  projectName: string,
+  projectLocation: string,
+) {
+  const sitePart = status === "assigned" ? siteAssignmentKey(projectName, projectLocation) : "";
+  return `${normBulkCompareKey(category)}|${status}|${unitType}|${sitePart}`;
+}
+
+function machineMatchesBulkInventory(
+  machine: Machine,
+  sites: Site[],
+  companyId: string | null,
+  category: string,
+  status: MachineryStatus,
+  unitType: MachineryUnitType,
+  projectName: string,
+  projectLocation: string,
+): boolean {
+  if (companyId && machine.companyId !== companyId) return false;
+  if (normBulkCompareKey(machine.category) !== normBulkCompareKey(category)) return false;
+  if (machine.status !== status) return false;
+  if (machine.unitType !== unitType) return false;
+
+  if (status === "assigned") {
+    const matchedSite = findBulkSiteMatch(sites, projectName, projectLocation);
+    if (matchedSite && machine.assignedSiteId === matchedSite.id) return true;
+  }
+
+  const targetKey = bulkMachineryInventoryKey(category, status, unitType, projectName, projectLocation);
+  const machineKey = bulkMachineryInventoryKey(
+    machine.category,
+    machine.status,
+    machine.unitType,
+    machine.projectName ?? "",
+    machine.projectLocation ?? "",
+  );
+  return machineKey === targetKey;
+}
+
+function countExistingBulkMachinery(
+  machines: Machine[],
+  sites: Site[],
+  companyId: string | null,
+  category: string,
+  status: MachineryStatus,
+  unitType: MachineryUnitType,
+  projectName: string,
+  projectLocation: string,
+): number {
+  return machines.filter((machine) =>
+    machineMatchesBulkInventory(machine, sites, companyId, category, status, unitType, projectName, projectLocation),
+  ).length;
+}
+
+/** CSV qty is added to existing inventory (e.g. 15 existing + 5 in file → create 5 new units). */
+function bulkUnitsToCreate(csvQty: number): number {
+  return csvQty <= 0 ? 0 : csvQty;
+}
+
 function findBulkSiteMatch(sitesForForm: Site[], projectName: string, projectLocation: string): Site | null {
   const nameKey = normBulkCompareKey(projectName);
   const locKey = normBulkCompareKey(projectLocation);
@@ -141,9 +205,20 @@ function bulkValidationUniqueCodes(rows: BulkParsedRow[], machines: Machine[]): 
   return null;
 }
 
+type BulkCsvLineSpec = {
+  projectName: string;
+  projectLocation: string;
+  category: string;
+  status: MachineryStatus;
+  unitType: MachineryUnitType;
+  qty: number;
+};
+
 function parseBulkStructural(
   csvInput: string,
   machines: Machine[],
+  sites: Site[],
+  companyId: string | null,
 ): { ok: true; rows: BulkParsedRow[] } | { ok: false; error: string } {
   const lines = csvInput
     .split(/\r?\n/)
@@ -157,6 +232,7 @@ function parseBulkStructural(
     const reservedCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
     const categoryCursors = new Map<string, MachineryCodegenCursor>();
     const parsedRows: BulkParsedRow[] = [];
+    const aggregated = new Map<string, BulkCsvLineSpec>();
 
     lines.forEach((line, index) => {
       const cells = parseCsvLine(line);
@@ -182,23 +258,33 @@ function parseBulkStructural(
       if (!status) throw new Error(`Row ${index + 1}: invalid status "${statusRaw}".`);
 
       const unitType = normalizeMachineryUnitType(unitTypeLabel);
-      const categoryKey = category.toLowerCase();
+      const invKey = bulkMachineryInventoryKey(category, status, unitType, projectName, projectLocation);
+      const prev = aggregated.get(invKey);
+      if (prev) prev.qty += qty;
+      else {
+        aggregated.set(invKey, { projectName, projectLocation, category, status, unitType, qty });
+      }
+    });
+
+    aggregated.forEach((spec) => {
+      const unitsToAdd = bulkUnitsToCreate(spec.qty);
+      if (unitsToAdd === 0) return;
+
+      const categoryKey = spec.category.toLowerCase();
       let cursor = categoryCursors.get(categoryKey);
       if (!cursor) {
-        cursor = seedCategoryCodegen(category, machines, reservedCodes);
+        cursor = seedCategoryCodegen(spec.category, machines, reservedCodes);
         categoryCursors.set(categoryKey, cursor);
       }
 
-      if (qty === 0) return;
-
-      const generated = takeMachineryUnitsFromCursor(cursor, qty, reservedCodes);
+      const generated = takeMachineryUnitsFromCursor(cursor, unitsToAdd, reservedCodes);
       generated.forEach((unit) => {
         parsedRows.push({
-          category,
-          status,
-          projectName,
-          projectLocation,
-          unitType,
+          category: spec.category,
+          status: spec.status,
+          projectName: spec.projectName,
+          projectLocation: spec.projectLocation,
+          unitType: spec.unitType,
           code: unit.code,
           name: unit.name,
         });
@@ -237,6 +323,9 @@ function bulkSiteConfirmQueue(rows: BulkParsedRow[], sitesForForm: Site[]): Bulk
 function bulkGroupParsedRows(
   rows: BulkParsedRow[],
   resolutions: Record<string, ResolvedBulkSite>,
+  machines: Machine[],
+  sites: Site[],
+  companyId: string | null,
 ): BulkPreviewGroup[] {
   const grouped = new Map<string, BulkPreviewGroup>();
 
@@ -269,6 +358,16 @@ function bulkGroupParsedRows(
         assignedSiteId,
         siteName,
         unitType: row.unitType,
+        existingUnitCount: countExistingBulkMachinery(
+          machines,
+          sites,
+          companyId,
+          row.category,
+          row.status,
+          row.unitType,
+          row.projectName,
+          row.projectLocation,
+        ),
         units: [unit],
       });
     }
@@ -362,6 +461,16 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   const finalCategory = form.category === "__new__" ? form.customCategory.trim() : form.category.trim();
   const safeQuantity = Math.max(1, form.quantity);
 
+  /** Stable snapshot so unit codegen does not re-run on every machinery query refetch. */
+  const categoryMachineryKey = useMemo(() => {
+    if (!finalCategory) return "";
+    return machines
+      .filter((machine) => machine.category.toLowerCase() === finalCategory.toLowerCase())
+      .map((machine) => `${machine.code}\u0001${machine.name}`)
+      .sort()
+      .join("\u0002");
+  }, [finalCategory, machines]);
+
   const suggestedUnits = useMemo(() => {
     if (!finalCategory) return [];
     const categoryMachines = machines.filter((machine) => machine.category.toLowerCase() === finalCategory.toLowerCase());
@@ -404,11 +513,26 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         name: `${nameBase}${nameNumber}`,
       };
     });
-  }, [finalCategory, machines, safeQuantity]);
+  }, [finalCategory, categoryMachineryKey, machines, safeQuantity]); // machines read when categoryMachineryKey changes
+
+  const unitCodegenKey = `${finalCategory}|${safeQuantity}|${categoryMachineryKey}`;
 
   useEffect(() => {
-    setUnitEntries(suggestedUnits);
-  }, [suggestedUnits]);
+    setUnitEntries((prev) => {
+      if (
+        prev.length === suggestedUnits.length &&
+        prev.every((entry, index) => {
+          const next = suggestedUnits[index];
+          return next && entry.code === next.code && entry.name === next.name;
+        })
+      ) {
+        return prev;
+      }
+      return suggestedUnits;
+    });
+    // Regenerate when category/qty/existing codes change — not on every machines[] reference.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- suggestedUnits is derived from unitCodegenKey
+  }, [unitCodegenKey]);
 
   const resetForm = () => {
     setForm({
@@ -517,14 +641,15 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       const stepKey = wiz.queue[wiz.index].key;
       const resolutions = { ...wiz.resolutions, [stepKey]: resolution };
       const nextIndex = wiz.index + 1;
+      const ownerCompanyId = user.role === "super_admin" ? poolCompanyId : user.companyId;
       if (nextIndex >= wiz.queue.length) {
         try {
-          const groups = bulkGroupParsedRows(wiz.stagingRows, resolutions);
+          const groups = bulkGroupParsedRows(wiz.stagingRows, resolutions, machines, sitesForForm, ownerCompanyId || null);
           setBulkPreview(groups);
           const total = groups.reduce((sum, g) => sum + g.units.length, 0);
           toast({
             title: "Preview ready",
-            description: `Site setup finished (${wiz.queue.length} site${wiz.queue.length !== 1 ? "s" : ""}). Review ${total} unit(s) in ${groups.length} group(s) below, then confirm.`,
+            description: `Site setup finished (${wiz.queue.length} site${wiz.queue.length !== 1 ? "s" : ""}). Review ${total} new unit(s) in ${groups.length} group(s) below, then confirm.`,
           });
         } catch (err) {
           toast({
@@ -543,11 +668,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         ui: wizardUiSeed(wiz.queue[nextIndex]),
       };
     },
-    [],
+    [machines, poolCompanyId, sitesForForm, user.companyId, user.role],
   );
 
   const onBulkPreview = (csvInput = bulkCsv) => {
-    const structured = parseBulkStructural(csvInput, machines);
+    const ownerCompanyId = user.role === "super_admin" ? poolCompanyId : user.companyId;
+    const structured = parseBulkStructural(csvInput, machines, sitesForForm, ownerCompanyId || null);
     if (!structured.ok) {
       toast({ title: "Could not parse CSV", description: structured.error, variant: "destructive" });
       return;
@@ -555,7 +681,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     if (structured.rows.length === 0) {
       toast({
         title: "No units to import",
-        description: "Every row has qty 0. Set qty to at least 1 on rows where you want machinery created.",
+        description:
+          "Rows are qty 0, already at the listed total, or duplicate lines with no net increase. Adjust qty and try again.",
         variant: "destructive",
       });
       return;
@@ -568,7 +695,6 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     }
 
     const hasAssigned = structured.rows.some((r) => r.status === "assigned");
-    const ownerCompanyId = user.role === "super_admin" ? poolCompanyId : user.companyId;
     if (hasAssigned && !ownerCompanyId) {
       toast({
         title: "Company required",
@@ -585,12 +711,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
 
     if (queue.length === 0) {
       try {
-        const groups = bulkGroupParsedRows(structured.rows, {});
+        const groups = bulkGroupParsedRows(structured.rows, {}, machines, sitesForForm, ownerCompanyId || null);
         const total = groups.reduce((sum, g) => sum + g.units.length, 0);
         setBulkPreview(groups);
         toast({
           title: "Preview ready",
-          description: `Review ${total} unit(s) in ${groups.length} group(s) below, then confirm.`,
+          description: `Review ${total} new unit(s) in ${groups.length} group(s) below, then confirm.`,
         });
       } catch (err) {
         toast({
@@ -1100,7 +1226,19 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                     </select>
                   </div>
                 )}
-                <p className="text-sm font-medium">Review import ({bulkPreview.reduce((n, g) => n + g.units.length, 0)} units)</p>
+                <p className="text-sm font-medium">
+                  Review import (+{bulkPreview.reduce((n, g) => n + g.units.length, 0)} new unit
+                  {bulkPreview.reduce((n, g) => n + g.units.length, 0) === 1 ? "" : "s"})
+                </p>
+                <ul className="space-y-1 text-xs text-muted-foreground">
+                  {bulkPreview.map((group) => (
+                    <li key={`${group.category}-${group.status}-${group.assignedSiteId ?? "pool"}-${group.unitType}`}>
+                      <span className="font-medium text-foreground">{group.category}</span> ({group.status}
+                      {group.status === "assigned" ? ` · ${group.siteName}` : ""}): {group.existingUnitCount} existing +{" "}
+                      {group.units.length} new = {group.existingUnitCount + group.units.length} total
+                    </li>
+                  ))}
+                </ul>
                 <p className="text-xs text-muted-foreground">Nothing is saved until you confirm. Use Back to file to pick another file and preview again.</p>
                 <div className="max-h-72 overflow-auto rounded-md border border-border">
                   <table className="min-w-[900px] text-xs">
@@ -1152,7 +1290,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   CSV columns (6): <span className="font-mono">projectName, location, category, qty, unit_type, status</span>
                 </p>
                 <p className="text-xs text-muted-foreground">
-                  <span className="font-mono">qty</span> is how many units to create (0 or more); codes and names are auto-generated (same as Single Add).{" "}
+                  <span className="font-mono">qty</span> is added to existing machinery with the same category, status, site, and unit type (e.g. 15
+                  existing + 5 in file = 20 total). Codes and names are auto-generated for new units only.{" "}
                   <span className="font-mono">unit_type</span>: nos, metre, kg, or any custom label (e.g. tonne).
                 </p>
                 <p className="text-xs text-muted-foreground">

@@ -71,20 +71,93 @@ export function sortSiteHistoryEntries(entries: LedgerEntry[]): LedgerEntry[] {
   );
 }
 
+/** Strip auto-numbered suffixes (e.g. "LADDER 6MTR 1" → "LADDER 6MTR") for grouped display. */
+export function normalizeMachineryGroupName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) return trimmed;
+  const match = trimmed.match(/^(.*?)(\d+)\s*$/);
+  if (match && match[1].trim()) return match[1].trim();
+  return trimmed;
+}
+
+export function machineryGroupLabel(machine: Machine): string {
+  return normalizeMachineryGroupName(machine.name);
+}
+
 export function machineryLineKey(machine: Machine): string {
-  return `${machine.name}::${machine.category}`;
+  return `${normalizeMachineryGroupName(machine.name)}::${machine.category}`;
+}
+
+export const CUSTOM_MOVEMENT_SOURCE_VALUE = "__new__";
+export const CUSTOM_STATUS_SELECT_PREFIX = "custom:";
+
+export function customStatusSelectValue(label: string): string {
+  return `${CUSTOM_STATUS_SELECT_PREFIX}${label}`;
+}
+
+export function isSavedCustomStatusSelect(value: string): boolean {
+  return value.startsWith(CUSTOM_STATUS_SELECT_PREFIX);
+}
+
+export function labelFromCustomStatusSelect(value: string): string {
+  return value.slice(CUSTOM_STATUS_SELECT_PREFIX.length);
+}
+
+const RESERVED_SOURCE_POOL_LABELS = new Set([
+  "available",
+  "assigned",
+  "maintenance",
+  "lost_damaged",
+  "lost/damaged",
+]);
+
+export function isReservedSourcePoolLabel(label: string): boolean {
+  return RESERVED_SOURCE_POOL_LABELS.has(label.trim().toLowerCase());
+}
+
+const STANDARD_POOL_LABELS: Record<MachineryStatus, string> = {
+  available: "Available",
+  assigned: "Assigned",
+  maintenance: "Maintenance",
+  lost_damaged: "Lost/damaged",
+};
+
+export function parseSourcePoolFromSummary(summary?: string): {
+  isCustom: boolean;
+  customLabel: string;
+  sourceStatus: MachineryStatus;
+} {
+  const match = summary?.match(/\(([^)]+) pool\)/i);
+  if (!match) {
+    return { isCustom: false, customLabel: "", sourceStatus: "assigned" };
+  }
+  const poolLabel = match[1].trim();
+  const lower = poolLabel.toLowerCase();
+  if (lower === "available") return { isCustom: false, customLabel: "", sourceStatus: "available" };
+  if (lower === "assigned") return { isCustom: false, customLabel: "", sourceStatus: "assigned" };
+  if (lower === "maintenance") return { isCustom: false, customLabel: "", sourceStatus: "maintenance" };
+  if (lower === "lost/damaged" || lower === "lost_damaged") {
+    return { isCustom: false, customLabel: "", sourceStatus: "lost_damaged" };
+  }
+  return { isCustom: true, customLabel: poolLabel, sourceStatus: "available" };
 }
 
 export function parseSourceStatusFromSummary(summary?: string): MachineryStatus {
-  const match = summary?.match(/\((Available|Assigned|Maintenance) pool\)/i);
-  if (!match) return "assigned";
-  return match[1].toLowerCase() as MachineryStatus;
+  return parseSourcePoolFromSummary(summary).sourceStatus;
+}
+
+export function formatMovementPoolLabel(sourceStatus: MachineryStatus, customLabel?: string): string {
+  const trimmed = customLabel?.trim();
+  if (trimmed) return trimmed;
+  return STANDARD_POOL_LABELS[sourceStatus] ?? sourceStatus;
 }
 
 export type MovementEditDraft = {
   ledgerId: string;
   direction: MachineryMovementDirection;
   sourceStatus: MachineryStatus;
+  isCustomSource: boolean;
+  customSourceLabel: string;
   movementDate: string;
   gatePassNumber: string;
   machineIds: string[];
@@ -95,7 +168,7 @@ export type MovementEditDraft = {
 
 export function parseMovementEditFromLedger(entry: LedgerEntry, machines: Machine[]): MovementEditDraft {
   const direction = ledgerMovementDirection(entry);
-  const sourceStatus = parseSourceStatusFromSummary(entry.summary);
+  const pool = parseSourcePoolFromSummary(entry.summary);
   const gatePass = parseGatePassFromSummary(entry.summary);
   const machineIds = [...entry.machineIds];
   const quantity = entry.totalUnits || machineIds.length || 1;
@@ -106,7 +179,9 @@ export function parseMovementEditFromLedger(entry: LedgerEntry, machines: Machin
   return {
     ledgerId: entry.id,
     direction,
-    sourceStatus,
+    sourceStatus: pool.sourceStatus,
+    isCustomSource: pool.isCustom,
+    customSourceLabel: pool.customLabel,
     movementDate: movementDateIso(entry).slice(0, 10),
     gatePassNumber: gatePass === "—" ? "" : gatePass,
     machineIds,

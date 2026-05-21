@@ -14,8 +14,8 @@ export function useDashboardMetrics() {
   const requestsQuery = useRequestsQuery();
   const ledgerQuery = useLedgerQuery();
 
-  const isLoading =
-    sitesQuery.isPending || machineryQuery.isPending || requestsQuery.isPending || ledgerQuery.isPending;
+  const queries = [sitesQuery, machineryQuery, requestsQuery, ledgerQuery];
+  const isLoading = queries.some((q) => q.data === undefined && (q.isPending || q.isFetching));
 
   return useMemo(() => {
     const activeSitesList = sites.filter((site) => site.status !== "completed");

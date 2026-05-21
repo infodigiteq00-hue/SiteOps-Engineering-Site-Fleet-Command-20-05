@@ -129,15 +129,6 @@ const Machinery = () => {
     });
   };
 
-  if (user.role === "site_manager") {
-    return (
-      <div className="rounded-xl border border-border bg-card p-8 text-center text-sm text-muted-foreground">
-        The full machinery catalog is maintained by Firm Admin, Senior Managers, and Store Managers. Open <strong>Sites</strong> to see
-        equipment deployed at locations assigned to you.
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">

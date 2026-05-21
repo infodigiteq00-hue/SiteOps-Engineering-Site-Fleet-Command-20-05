@@ -1,7 +1,7 @@
 import type { PlatformRole } from "@/lib/session";
 
 export function canCreateSite(role: PlatformRole): boolean {
-  return role === "firm_admin" || role === "senior_manager" || role === "super_admin";
+  return role === "firm_admin" || role === "senior_manager" || role === "site_manager" || role === "super_admin";
 }
 
 export function canManageCompanyUsers(role: PlatformRole): boolean {
@@ -17,13 +17,14 @@ export function canAddMachinery(role: PlatformRole): boolean {
     role === "firm_admin" ||
     role === "senior_manager" ||
     role === "store_manager" ||
+    role === "site_manager" ||
     role === "super_admin"
   );
 }
 
-/** Site managers may request machinery; Firm Admin etc. approve instead of submitting as primary flow. */
+/** Legacy request-submit flow (viewer / other roles only). Site managers use senior-style approve + add machinery. */
 export function canCreateMachineryRequest(role: PlatformRole): boolean {
-  return role === "site_manager";
+  return false;
 }
 
 export function canApproveRequests(role: PlatformRole): boolean {
@@ -31,7 +32,18 @@ export function canApproveRequests(role: PlatformRole): boolean {
     role === "firm_admin" ||
     role === "senior_manager" ||
     role === "store_manager" ||
+    role === "site_manager" ||
     role === "super_admin"
+  );
+}
+
+/** Site card edit actions (name, managers, finish workflow) — same as senior manager. */
+export function canUpdateSite(role: PlatformRole): boolean {
+  return (
+    role === "super_admin" ||
+    role === "firm_admin" ||
+    role === "senior_manager" ||
+    role === "site_manager"
   );
 }
 

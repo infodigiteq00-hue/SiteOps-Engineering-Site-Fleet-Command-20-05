@@ -68,10 +68,6 @@ const NewSite = () => {
       toast({ title: "Missing fields", description: "Please add site name and location.", variant: "destructive" });
       return;
     }
-    if (form.machineIds.length === 0) {
-      toast({ title: "No machinery selected", description: "Please allot at least one available machine.", variant: "destructive" });
-      return;
-    }
     if (!resolvedCompanyId) {
       toast({ title: "No company", description: "Pick a company (Super Admin) or ensure your profile has a company.", variant: "destructive" });
       return;
@@ -81,7 +77,13 @@ const NewSite = () => {
         ...form,
         companyId: resolvedCompanyId,
       });
-      toast({ title: "Site created", description: "New site is live with allotted machinery." });
+      toast({
+        title: "Site created",
+        description:
+          form.machineIds.length > 0
+            ? "New site is live with allotted machinery."
+            : "New site is live. You can allot machinery later from the site page.",
+      });
       navigate(`/sites/${siteId}`);
     } catch (err) {
       toast({

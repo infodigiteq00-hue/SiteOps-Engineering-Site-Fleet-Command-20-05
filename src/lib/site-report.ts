@@ -3,6 +3,7 @@ import type { LedgerEntry, Machine, Site, SiteClosureSummary } from "@/domain/ty
 import {
   classifySiteHistoryEntry,
   isMovementEntry,
+  machineryGroupLabel,
   machineryLineKey,
   movementDateIso,
   parseGatePassFromSummary,
@@ -202,7 +203,7 @@ export function buildSiteReport(
     if (existing) {
       existing.count += 1;
     } else {
-      onSiteByLine.set(key, { count: 1, category: machine.category, label: machine.name });
+      onSiteByLine.set(key, { count: 1, category: machine.category, label: machineryGroupLabel(machine) });
     }
   }
 

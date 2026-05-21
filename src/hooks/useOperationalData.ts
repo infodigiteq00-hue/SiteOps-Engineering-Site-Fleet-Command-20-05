@@ -5,7 +5,11 @@ import { mapSite, mapMachinery, mapRequest, mapLedger, type CompanyRow } from "@
 import type { Site, SiteStatus, MachineryStatus, MachineryCategory, RequestSourceType } from "@/domain/types";
 import { buildClosureSummaryFromDispositions } from "@/lib/site-closure-summary";
 import type { MachineryMovementDirection } from "@/lib/site-allocation-history";
-import { movementEventKindFromDirection } from "@/lib/site-allocation-history";
+import {
+  formatMovementPoolLabel,
+  isReservedSourcePoolLabel,
+  movementEventKindFromDirection,
+} from "@/lib/site-allocation-history";
 import type { SiteClosureDisposition } from "@/lib/site-closure";
 
 export type { MachineryMovementDirection } from "@/lib/site-allocation-history";
@@ -23,6 +27,14 @@ export const operationalKeys = {
   requests: () => [...operationalKeys.all, "requests"] as const,
   ledger: () => [...operationalKeys.all, "ledger"] as const,
   companies: () => [...operationalKeys.all, "companies"] as const,
+  machinerySourceStatuses: (companyId: string) =>
+    [...operationalKeys.all, "machinery-source-statuses", companyId] as const,
+};
+
+export type CompanyMachinerySourceStatus = {
+  id: string;
+  companyId: string;
+  label: string;
 };
 
 function queriesEnabled(enabled: boolean) {
@@ -104,6 +116,45 @@ export function useCompaniesQuery() {
   const { isSupabaseEnabled, session } = useAuth();
   const ok = queriesEnabled(isSupabaseEnabled && Boolean(session));
   return useQuery({ queryKey: operationalKeys.companies(), queryFn: fetchCompanies, enabled: ok });
+}
+
+async function fetchMachinerySourceStatuses(companyId: string): Promise<CompanyMachinerySourceStatus[]> {
+  const rows = await fetchAllSupabasePages((from, to) =>
+    supabase
+      .from("company_machinery_source_statuses")
+      .select("id, company_id, label")
+      .eq("company_id", companyId)
+      .order("label")
+      .range(from, to),
+  );
+  return rows.map((row) => ({
+    id: String(row.id),
+    companyId: String(row.company_id),
+    label: String(row.label),
+  }));
+}
+
+/** Persist a custom source/status label for the company dropdown (ignores duplicates). */
+export async function ensureCompanyMachinerySourceStatus(companyId: string, label: string): Promise<void> {
+  const trimmed = label.trim();
+  if (!trimmed || isReservedSourcePoolLabel(trimmed)) return;
+
+  const { error } = await supabase.from("company_machinery_source_statuses").insert({
+    company_id: companyId,
+    label: trimmed,
+  });
+  if (error && error.code !== "23505") throw error;
+}
+
+export function useMachinerySourceStatusesQuery(companyId: string | undefined) {
+  const { isSupabaseEnabled, session } = useAuth();
+  const ok = queriesEnabled(isSupabaseEnabled && Boolean(session) && Boolean(companyId));
+  return useQuery({
+    queryKey: operationalKeys.machinerySourceStatuses(companyId ?? ""),
+    queryFn: () => fetchMachinerySourceStatuses(companyId!),
+    enabled: ok,
+    ...OPERATIONAL_LIVE_QUERY,
+  });
 }
 
 /** Resolved company display names from Supabase (empty until loaded). */
@@ -846,6 +897,8 @@ export type RecordMachineryMovementInput = {
   companyId: string;
   direction: MachineryMovementDirection;
   sourceStatus: MachineryStatus;
+  /** When set, movement is ledger-only with this pool label (no machinery row updates). */
+  customSourceStatus?: string;
   movementDate: string;
   gatePassNumber?: string;
   machineIds: string[];
@@ -870,11 +923,12 @@ function buildMovementSummary(input: {
   siteName: string;
   actorName: string;
   sourceStatus: MachineryStatus;
+  customSourceStatus?: string;
   gatePassNumber?: string;
 }): string {
   const gatePass = input.gatePassNumber?.trim();
   const gatePassNote = gatePass ? ` · Gate pass ${gatePass}` : "";
-  const poolLabel = input.sourceStatus.charAt(0).toUpperCase() + input.sourceStatus.slice(1);
+  const poolLabel = formatMovementPoolLabel(input.sourceStatus, input.customSourceStatus);
   const movementVerb = input.direction === "in" ? "moved OUT from" : "received IN at";
   return `${input.quantity} Qty ${input.machineryLabel} ${movementVerb} ${input.siteName} by ${input.actorName} (${poolLabel} pool)${gatePassNote}.`;
 }
@@ -900,26 +954,39 @@ export function useRecordMachineryMovementMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (input: RecordMachineryMovementInput) => {
-      if (input.machineIds.length === 0 || input.quantity < 1) {
-        throw new Error("Select machinery and quantity");
+      const customPool = input.customSourceStatus?.trim();
+      const isCustomPool = Boolean(customPool);
+
+      if (input.quantity < 1) {
+        throw new Error("Enter a quantity of 1 or more");
       }
-      if (input.machineIds.length !== input.quantity) {
-        throw new Error("Quantity does not match selected units");
+      if (!input.machineryLabel.trim()) {
+        throw new Error("Enter machinery name");
       }
 
-      const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
-      const { error } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
-      if (error) throw error;
+      if (!isCustomPool) {
+        if (input.machineIds.length === 0) {
+          throw new Error("Select machinery and quantity");
+        }
+        if (input.machineIds.length !== input.quantity) {
+          throw new Error("Quantity does not match selected units");
+        }
+
+        const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
+        const { error } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
+        if (error) throw error;
+      }
 
       const actor = peekCurrentUser();
       const actorName = actor?.name ?? "System";
       const summary = buildMovementSummary({
         quantity: input.quantity,
-        machineryLabel: input.machineryLabel,
+        machineryLabel: input.machineryLabel.trim(),
         direction: input.direction,
         siteName: input.siteName,
         actorName,
         sourceStatus: input.sourceStatus,
+        customSourceStatus: customPool,
         gatePassNumber: input.gatePassNumber,
       });
 
@@ -941,6 +1008,10 @@ export function useRecordMachineryMovementMutation() {
       } catch (err) {
         console.warn("[ledger] append skipped after machinery movement", err);
       }
+
+      if (isCustomPool && customPool) {
+        await ensureCompanyMachinerySourceStatus(input.companyId, customPool);
+      }
     },
     onSuccess: () => invalidateOperational(qc),
   });
@@ -951,6 +1022,7 @@ export type UpdateMachineryMovementInput = RecordMachineryMovementInput & {
   original: {
     direction: MachineryMovementDirection;
     sourceStatus: MachineryStatus;
+    customSourceStatus?: string;
     machineIds: string[];
   };
 };
@@ -959,18 +1031,31 @@ export function useUpdateMachineryMovementMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (input: UpdateMachineryMovementInput) => {
-      if (input.machineIds.length === 0 || input.quantity < 1) {
-        throw new Error("Select machinery and quantity");
+      const customPool = input.customSourceStatus?.trim();
+      const isCustomPool = Boolean(customPool);
+      const wasCustomPool = Boolean(input.original.customSourceStatus?.trim());
+
+      if (input.quantity < 1) {
+        throw new Error("Enter a quantity of 1 or more");
       }
-      if (input.machineIds.length !== input.quantity) {
-        throw new Error("Quantity does not match selected units");
+      if (!input.machineryLabel.trim()) {
+        throw new Error("Enter machinery name");
+      }
+
+      if (!isCustomPool) {
+        if (input.machineIds.length === 0) {
+          throw new Error("Select machinery and quantity");
+        }
+        if (input.machineIds.length !== input.quantity) {
+          throw new Error("Quantity does not match selected units");
+        }
       }
 
       const inverseDirection: MachineryMovementDirection = input.original.direction === "in" ? "out" : "in";
       const revertSource = revertSourceStatusForMovement(input.original.direction, input.original.sourceStatus);
       const revertPatch = movementUpdatesForDirection(inverseDirection, revertSource, input.siteId);
 
-      if (input.original.machineIds.length > 0) {
+      if (!wasCustomPool && input.original.machineIds.length > 0) {
         const { error: revertErr } = await supabase
           .from("machinery")
           .update(revertPatch)
@@ -978,19 +1063,22 @@ export function useUpdateMachineryMovementMutation() {
         if (revertErr) throw revertErr;
       }
 
-      const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
-      const { error: applyErr } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
-      if (applyErr) throw applyErr;
+      if (!isCustomPool) {
+        const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
+        const { error: applyErr } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
+        if (applyErr) throw applyErr;
+      }
 
       const actor = peekCurrentUser();
       const actorName = actor?.name ?? "System";
       const summary = buildMovementSummary({
         quantity: input.quantity,
-        machineryLabel: input.machineryLabel,
+        machineryLabel: input.machineryLabel.trim(),
         direction: input.direction,
         siteName: input.siteName,
         actorName,
         sourceStatus: input.sourceStatus,
+        customSourceStatus: customPool,
         gatePassNumber: input.gatePassNumber,
       });
 
@@ -999,7 +1087,7 @@ export function useUpdateMachineryMovementMutation() {
         .update({
           event_kind: movementEventKindFromDirection(input.direction),
           summary,
-          machine_ids: input.machineIds,
+          machine_ids: isCustomPool ? [] : input.machineIds,
           from_date: input.movementDate,
           until_date: null,
           total_units: input.quantity,
@@ -1008,6 +1096,10 @@ export function useUpdateMachineryMovementMutation() {
         })
         .eq("id", input.ledgerEntryId);
       if (ledgerErr) throw ledgerErr;
+
+      if (isCustomPool && customPool) {
+        await ensureCompanyMachinerySourceStatus(input.companyId, customPool);
+      }
     },
     onSuccess: () => invalidateOperational(qc),
   });

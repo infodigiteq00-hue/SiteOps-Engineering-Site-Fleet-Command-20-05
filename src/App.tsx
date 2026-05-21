@@ -24,7 +24,14 @@ import Login from "./pages/Login.tsx";
 import Signup from "./pages/Signup.tsx";
 import ResetPassword from "./pages/ResetPassword.tsx";
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 2,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
 const App = () => (
   <AuthProvider>

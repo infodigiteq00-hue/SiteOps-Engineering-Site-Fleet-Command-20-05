@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 import { ROLE_LABELS, initialsFromName, useCurrentUser, type PlatformRole } from "@/lib/session";
 import { canCreateSite, canManageCompanyUsers, canAccessPlatformAdmin } from "@/lib/rbac";
 import { useScopedRequests } from "@/hooks/useCompanyScope";
+import { useOperationalBootstrap } from "@/hooks/useOperationalData";
 import { useAuth } from "@/contexts/AuthContext";
 import { isSupabaseConfigured } from "@/lib/supabaseClient";
 
@@ -34,13 +35,9 @@ function buildNav(role: PlatformRole): NavItem[] {
   const items: NavItem[] = [
     { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
     { to: "/sites", label: "Sites", icon: Building2 },
+    { to: "/machinery", label: "Machinery List", icon: Wrench },
+    { to: "/machinery-overview", label: "Machinery Overview", icon: Layers3 },
   ];
-  if (role !== "site_manager") {
-    items.push(
-      { to: "/machinery", label: "Machinery List", icon: Wrench },
-      { to: "/machinery-overview", label: "Machinery Overview", icon: Layers3 },
-    );
-  }
   items.push(
     { to: "/requests", label: "Requests", icon: ClipboardList },
     { to: "/ledger", label: "Audit Ledger", icon: ScrollText },
@@ -56,7 +53,8 @@ function buildNav(role: PlatformRole): NavItem[] {
 
 export const AppShell = () => {
   useOperationalRealtime();
-  const { signOut } = useAuth();
+  const { signOut, isSupabaseEnabled } = useAuth();
+  const { isBootstrapping, hasError, errorMessage } = useOperationalBootstrap();
   const currentUser = useCurrentUser();
   const location = useLocation();
   const pendingCount = useScopedRequests().filter((r) => r.status === "pending").length;
@@ -140,7 +138,27 @@ export const AppShell = () => {
           </div>
         </header>
         <main className="flex-1 overflow-auto p-6">
-          <Outlet />
+          {isSupabaseEnabled && isBootstrapping ? (
+            <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3 text-center text-muted-foreground">
+              <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" aria-hidden />
+              <p className="text-sm font-medium text-foreground">Loading organization data…</p>
+              <p className="max-w-sm text-xs">Sites, machinery, and requests are syncing. This may take a moment on first load.</p>
+            </div>
+          ) : isSupabaseEnabled && hasError ? (
+            <div className="flex min-h-[40vh] flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-card/50 p-8 text-center">
+              <p className="text-sm font-medium text-foreground">Could not load data</p>
+              <p className="max-w-md text-xs text-muted-foreground">{errorMessage}</p>
+              <button
+                type="button"
+                className="mt-2 text-sm font-medium text-primary underline-offset-2 hover:underline"
+                onClick={() => window.location.reload()}
+              >
+                Refresh page
+              </button>
+            </div>
+          ) : (
+            <Outlet />
+          )}
         </main>
       </div>
     </div>

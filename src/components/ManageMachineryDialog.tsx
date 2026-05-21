@@ -4,12 +4,19 @@ import { format } from "date-fns";
 import type { LedgerEntry, Machine, MachineryStatus, Site } from "@/domain/types";
 import { cn } from "@/lib/utils";
 import {
+  CUSTOM_MOVEMENT_SOURCE_VALUE,
+  customStatusSelectValue,
+  isReservedSourcePoolLabel,
+  isSavedCustomStatusSelect,
+  labelFromCustomStatusSelect,
+  machineryGroupLabel,
   machineryLineKey,
   movementDirectionDisplayLabel,
   parseMovementEditFromLedger,
   type MachineryMovementDirection,
 } from "@/lib/site-allocation-history";
 import {
+  useMachinerySourceStatusesQuery,
   useRecordMachineryMovementMutation,
   useUpdateMachineryMovementMutation,
 } from "@/hooks/useOperationalData";
@@ -25,7 +32,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Command,
@@ -93,7 +100,7 @@ function buildMachineryLines(eligible: Machine[]): MachineryLine[] {
 
   for (const machine of sorted) {
     const key = machineryLineKey(machine);
-    const entry = grouped.get(key) ?? { label: `${machine.code} — ${machine.name}`, machineIds: [] };
+    const entry = grouped.get(key) ?? { label: machineryGroupLabel(machine), machineIds: [] };
     entry.machineIds.push(machine.id);
     grouped.set(key, entry);
   }
@@ -136,6 +143,7 @@ export function ManageMachineryDialog({
 }: Props) {
   const recordMutation = useRecordMachineryMovementMutation();
   const updateMutation = useUpdateMachineryMovementMutation();
+  const { data: savedCustomStatuses = [] } = useMachinerySourceStatusesQuery(site.companyId);
   const [internalOpen, setInternalOpen] = useState(false);
   const isControlled = controlledOpen !== undefined;
   const open = isControlled ? controlledOpen : internalOpen;
@@ -150,18 +158,38 @@ export function ManageMachineryDialog({
   const originalSnapshot = useRef(editDraft);
 
   const [direction, setDirection] = useState<MachineryMovementDirection>("out");
+  const [sourceSelect, setSourceSelect] = useState<string>("available");
   const [sourceStatus, setSourceStatus] = useState<MachineryStatus>("available");
+  const [customSourceStatus, setCustomSourceStatus] = useState("");
+  const [customMachineryName, setCustomMachineryName] = useState("");
   const [movementDate, setMovementDate] = useState(() => format(new Date(), "yyyy-MM-dd"));
   const [gatePassNumber, setGatePassNumber] = useState("");
   const [selectedLineKey, setSelectedLineKey] = useState("");
   const [quantity, setQuantity] = useState(1);
   const [machineryPickerOpen, setMachineryPickerOpen] = useState(false);
 
+  const isNewCustomStatus = sourceSelect === CUSTOM_MOVEMENT_SOURCE_VALUE;
+  const isSavedCustomStatus = isSavedCustomStatusSelect(sourceSelect);
+  const isCustomPool = isNewCustomStatus || isSavedCustomStatus;
+  const activeCustomLabel = isSavedCustomStatus
+    ? labelFromCustomStatusSelect(sourceSelect)
+    : customSourceStatus.trim();
+  const sourceStatusLabel =
+    SOURCE_OPTIONS.find((opt) => opt.value === sourceStatus)?.label ?? sourceStatus;
+  const sourceSelectDisplay = isNewCustomStatus
+    ? customSourceStatus.trim() || "+ Add new status"
+    : isSavedCustomStatus
+      ? activeCustomLabel
+      : sourceStatusLabel;
+
   const includeMachineIds = isEditing && editDraft ? editDraft.machineIds : [];
 
   const eligibleMachines = useMemo(
-    () => getEligibleMachines(direction, sourceStatus, site.id, machines, includeMachineIds),
-    [direction, sourceStatus, site.id, machines, includeMachineIds],
+    () =>
+      isCustomPool
+        ? []
+        : getEligibleMachines(direction, sourceStatus, site.id, machines, includeMachineIds),
+    [direction, sourceStatus, site.id, machines, includeMachineIds, isCustomPool],
   );
 
   const machineryLines = useMemo(() => buildMachineryLines(eligibleMachines), [eligibleMachines]);
@@ -171,7 +199,7 @@ export function ManageMachineryDialog({
     [machineryLines, selectedLineKey],
   );
 
-  const maxQuantity = selectedLine?.availableCount ?? 0;
+  const maxQuantity = isCustomPool ? 0 : (selectedLine?.availableCount ?? 0);
   const isPending = recordMutation.isPending || updateMutation.isPending;
 
   useEffect(() => {
@@ -179,7 +207,23 @@ export function ManageMachineryDialog({
     if (editDraft) {
       originalSnapshot.current = editDraft;
       setDirection(editDraft.direction);
-      setSourceStatus(editDraft.sourceStatus);
+      if (editDraft.isCustomSource) {
+        const label = editDraft.customSourceLabel.trim();
+        const saved = savedCustomStatuses.find((row) => row.label.toLowerCase() === label.toLowerCase());
+        if (saved) {
+          setSourceSelect(customStatusSelectValue(saved.label));
+          setCustomSourceStatus("");
+        } else {
+          setSourceSelect(CUSTOM_MOVEMENT_SOURCE_VALUE);
+          setCustomSourceStatus(label);
+        }
+        setCustomMachineryName(editDraft.machineryLabel);
+      } else {
+        setSourceSelect(editDraft.sourceStatus);
+        setSourceStatus(editDraft.sourceStatus);
+        setCustomSourceStatus("");
+        setCustomMachineryName("");
+      }
       setMovementDate(editDraft.movementDate);
       setGatePassNumber(editDraft.gatePassNumber);
       setSelectedLineKey(editDraft.lineKey);
@@ -188,38 +232,126 @@ export function ManageMachineryDialog({
     }
     const defaults = defaultFormState();
     setDirection(defaults.direction);
+    setSourceSelect("assigned");
     setSourceStatus("assigned");
+    setCustomSourceStatus("");
+    setCustomMachineryName("");
     setMovementDate(defaults.movementDate);
     setGatePassNumber("");
     setSelectedLineKey("");
     setQuantity(1);
-  }, [open, editDraft]);
+  }, [open, editDraft, savedCustomStatuses]);
+
+  useEffect(() => {
+    if (!open || isEditing || isCustomPool) return;
+    const next = direction === "out" ? "assigned" : "available";
+    setSourceSelect(next);
+    setSourceStatus(next);
+  }, [direction, open, isEditing, isCustomPool]);
 
   useEffect(() => {
     if (!open || isEditing) return;
-    setSourceStatus(direction === "out" ? "assigned" : "available");
-  }, [direction, open, isEditing]);
-
-  useEffect(() => {
-    if (!open || isEditing) return;
+    if (isCustomPool) {
+      setSelectedLineKey("");
+      return;
+    }
     setSelectedLineKey("");
     setQuantity(1);
-  }, [direction, sourceStatus, open, isEditing]);
+  }, [direction, sourceStatus, open, isEditing, isCustomPool]);
 
   useEffect(() => {
-    if (quantity > maxQuantity && maxQuantity > 0) {
+    if (isCustomPool || maxQuantity <= 0) return;
+    if (quantity > maxQuantity) {
       setQuantity(maxQuantity);
     }
-  }, [maxQuantity, quantity]);
+  }, [maxQuantity, quantity, isCustomPool]);
 
   const resetAndClose = () => {
     setOpen(false);
     setGatePassNumber("");
     setSelectedLineKey("");
+    setCustomSourceStatus("");
+    setCustomMachineryName("");
     setQuantity(1);
   };
 
   const handleSubmit = () => {
+    if (isCustomPool) {
+      const statusLabel = activeCustomLabel;
+      const machineryName = customMachineryName.trim();
+      if (!statusLabel) {
+        toast({ title: "Status required", description: "Enter a name for the new status pool.", variant: "destructive" });
+        return;
+      }
+      if (isReservedSourcePoolLabel(statusLabel)) {
+        toast({
+          title: "Reserved name",
+          description: "That name is already used by a standard status. Choose another label.",
+          variant: "destructive",
+        });
+        return;
+      }
+      if (!machineryName) {
+        toast({ title: "Machinery required", description: "Enter the machinery name to record.", variant: "destructive" });
+        return;
+      }
+      if (quantity < 1) {
+        toast({ title: "Invalid quantity", description: "Enter a quantity of 1 or more.", variant: "destructive" });
+        return;
+      }
+
+      const payload = {
+        siteId: site.id,
+        siteName: site.name,
+        companyId: site.companyId,
+        direction,
+        sourceStatus: "available" as MachineryStatus,
+        customSourceStatus: statusLabel,
+        movementDate,
+        gatePassNumber: gatePassNumber.trim() || undefined,
+        machineIds: [] as string[],
+        machineryLabel: machineryName,
+        quantity,
+      };
+
+      const displayLabel = movementDirectionDisplayLabel(direction);
+      const onSuccess = () => {
+        toast({
+          title: isEditing ? "Movement updated" : `Movement ${displayLabel} recorded`,
+          description: `${quantity} unit(s) ${isEditing ? "updated for" : "logged for"} ${site.name}.`,
+        });
+        resetAndClose();
+      };
+      const onError = (err: Error) => {
+        toast({
+          title: isEditing ? "Could not update movement" : "Could not record movement",
+          description: err instanceof Error ? err.message : "Try again.",
+          variant: "destructive",
+        });
+      };
+
+      if (isEditing && originalSnapshot.current) {
+        const original = originalSnapshot.current;
+        updateMutation.mutate(
+          {
+            ...payload,
+            ledgerEntryId: original.ledgerId,
+            original: {
+              direction: original.direction,
+              sourceStatus: original.sourceStatus,
+              customSourceStatus: original.isCustomSource ? original.customSourceLabel : undefined,
+              machineIds: original.machineIds,
+            },
+          },
+          { onSuccess, onError },
+        );
+        return;
+      }
+
+      recordMutation.mutate(payload, { onSuccess, onError });
+      return;
+    }
+
     if (!selectedLine) {
       toast({ title: "Select machinery", description: "Choose a machinery type from the list.", variant: "destructive" });
       return;
@@ -273,6 +405,7 @@ export function ManageMachineryDialog({
           original: {
             direction: original.direction,
             sourceStatus: original.sourceStatus,
+            customSourceStatus: original.isCustomSource ? original.customSourceLabel : undefined,
             machineIds: original.machineIds,
           },
         },
@@ -294,7 +427,7 @@ export function ManageMachineryDialog({
           </Button>
         </DialogTrigger>
       )}
-      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent className="overflow-visible sm:max-w-lg">
         <DialogHeader>
           <DialogTitle className="font-display">{isEditing ? "Edit movement" : "Manage Machinery"}</DialogTitle>
           <DialogDescription>
@@ -347,9 +480,32 @@ export function ManageMachineryDialog({
           </MotionField>
 
           <MotionField label="Machinery source / status">
-            <Select value={sourceStatus} onValueChange={(v) => setSourceStatus(v as MachineryStatus)}>
+            <Select
+              value={sourceSelect}
+              onValueChange={(v) => {
+                if (v === CUSTOM_MOVEMENT_SOURCE_VALUE) {
+                  setSourceSelect(CUSTOM_MOVEMENT_SOURCE_VALUE);
+                  setCustomSourceStatus("");
+                  setCustomMachineryName("");
+                  setSelectedLineKey("");
+                  return;
+                }
+                if (isSavedCustomStatusSelect(v)) {
+                  setSourceSelect(v);
+                  setCustomSourceStatus("");
+                  setCustomMachineryName("");
+                  setSelectedLineKey("");
+                  return;
+                }
+                const next = v as MachineryStatus;
+                setSourceSelect(next);
+                setSourceStatus(next);
+                setCustomSourceStatus("");
+                setCustomMachineryName("");
+              }}
+            >
               <SelectTrigger>
-                <SelectValue />
+                <span className="truncate">{sourceSelectDisplay}</span>
               </SelectTrigger>
               <SelectContent>
                 {SOURCE_OPTIONS.map((opt) => (
@@ -357,12 +513,28 @@ export function ManageMachineryDialog({
                     {opt.label}
                   </SelectItem>
                 ))}
+                {savedCustomStatuses.map((row) => (
+                  <SelectItem key={row.id} value={customStatusSelectValue(row.label)}>
+                    {row.label}
+                  </SelectItem>
+                ))}
+                <SelectItem value={CUSTOM_MOVEMENT_SOURCE_VALUE}>+ Add new status</SelectItem>
               </SelectContent>
             </Select>
+            {isNewCustomStatus ? (
+              <Input
+                placeholder="e.g. On rent, Subcontractor pool"
+                value={customSourceStatus}
+                onChange={(e) => setCustomSourceStatus(e.target.value)}
+                maxLength={80}
+              />
+            ) : null}
             <p className="text-xs text-muted-foreground">
-              {direction === "out"
-                ? "Pool these units are leaving from at this site."
-                : "Pool these units are arriving from (company pool or another site)."}
+              {isCustomPool
+                ? "Custom pool — saved for your company and reusable in this list."
+                : direction === "out"
+                  ? "Pool these units are leaving from at this site."
+                  : "Pool these units are arriving from (company pool or another site)."}
             </p>
           </MotionField>
 
@@ -379,68 +551,90 @@ export function ManageMachineryDialog({
             <p className="text-xs text-muted-foreground">Optional — recommended for gate and yard tracking.</p>
           </MotionField>
 
-          <MotionField label="Select machinery">
-            <Popover open={machineryPickerOpen} onOpenChange={setMachineryPickerOpen}>
-              <PopoverTrigger asChild>
-                <Button
-                  type="button"
-                  variant="outline"
-                  role="combobox"
-                  aria-expanded={machineryPickerOpen}
-                  className="w-full justify-between font-normal"
-                  disabled={machineryLines.length === 0}
+          {isCustomPool ? (
+            <MotionField label="Machinery name">
+              <Input
+                placeholder="e.g. ALLU. LADDER 6MTR"
+                value={customMachineryName}
+                onChange={(e) => setCustomMachineryName(e.target.value)}
+                maxLength={200}
+              />
+            </MotionField>
+          ) : (
+            <MotionField label="Select machinery">
+              <Popover open={machineryPickerOpen} onOpenChange={setMachineryPickerOpen} modal={false}>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    role="combobox"
+                    aria-expanded={machineryPickerOpen}
+                    className="w-full justify-between font-normal"
+                    disabled={machineryLines.length === 0}
+                  >
+                    {selectedLine ? selectedLine.label : machineryLines.length ? "Search machinery…" : "No units in pool"}
+                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  className="z-[100] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0"
+                  align="start"
+                  onWheel={(e) => e.stopPropagation()}
                 >
-                  {selectedLine ? selectedLine.label : machineryLines.length ? "Search machinery…" : "No units in pool"}
-                  <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
-                <Command>
-                  <CommandInput placeholder="Search code or name…" />
-                  <CommandList>
-                    <CommandEmpty>No machinery in this pool.</CommandEmpty>
-                    <CommandGroup>
-                      {machineryLines.map((line) => (
-                        <CommandItem
-                          key={line.key}
-                          value={`${line.label} ${line.key}`}
-                          onSelect={() => {
-                            setSelectedLineKey(line.key);
-                            setQuantity(Math.min(quantity, line.availableCount) || 1);
-                            setMachineryPickerOpen(false);
-                          }}
-                        >
-                          <Check
-                            className={cn("mr-2 h-4 w-4", selectedLineKey === line.key ? "opacity-100" : "opacity-0")}
-                          />
-                          <span className="flex-1 truncate">{line.label}</span>
-                          <span className="ml-2 text-xs text-muted-foreground tabular-nums">{line.availableCount}</span>
-                        </CommandItem>
-                      ))}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
-          </MotionField>
+                  <Command className="flex flex-col overflow-hidden">
+                    <CommandInput placeholder="Search code or name…" />
+                    <div
+                      className="max-h-[min(260px,45vh)] overflow-y-auto overscroll-y-contain touch-pan-y"
+                      onWheel={(e) => e.stopPropagation()}
+                    >
+                      <CommandList className="max-h-none overflow-visible">
+                        <CommandEmpty>No machinery in this pool.</CommandEmpty>
+                        <CommandGroup className="overflow-visible p-1">
+                          {machineryLines.map((line) => (
+                            <CommandItem
+                              key={line.key}
+                              value={`${line.label} ${line.key}`}
+                              onSelect={() => {
+                                setSelectedLineKey(line.key);
+                                setQuantity(Math.min(quantity, line.availableCount) || 1);
+                                setMachineryPickerOpen(false);
+                              }}
+                            >
+                              <Check
+                                className={cn("mr-2 h-4 w-4", selectedLineKey === line.key ? "opacity-100" : "opacity-0")}
+                              />
+                              <span className="flex-1 truncate">{line.label}</span>
+                              <span className="ml-2 text-xs text-muted-foreground tabular-nums">{line.availableCount}</span>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </div>
+                  </Command>
+                </PopoverContent>
+              </Popover>
+            </MotionField>
+          )}
 
           <MotionField label="Quantity">
             <Input
               type="number"
               min={1}
-              max={maxQuantity || 1}
+              max={isCustomPool ? undefined : maxQuantity || 1}
               value={quantity}
-              disabled={!selectedLine}
+              disabled={!isCustomPool && !selectedLine}
               onChange={(e) => {
                 const next = Number.parseInt(e.target.value, 10);
-                if (Number.isFinite(next)) setQuantity(next);
+                if (Number.isFinite(next) && next >= 1) setQuantity(next);
               }}
             />
-            {selectedLine && (
+            {isCustomPool ? (
+              <p className="text-xs text-muted-foreground">No limit for custom status — enter any quantity.</p>
+            ) : selectedLine ? (
               <p className="text-xs text-muted-foreground">
                 {maxQuantity} unit{maxQuantity === 1 ? "" : "s"} available in this pool.
               </p>
-            )}
+            ) : null}
           </MotionField>
         </div>
 
@@ -451,7 +645,12 @@ export function ManageMachineryDialog({
           <Button
             type="button"
             onClick={handleSubmit}
-            disabled={!selectedLine || isPending}
+            disabled={
+              isPending ||
+              (isCustomPool
+                ? !activeCustomLabel || !customMachineryName.trim()
+                : !selectedLine)
+            }
             className={cn(
               direction === "in"
                 ? "bg-emerald-600 text-white hover:bg-emerald-700"
