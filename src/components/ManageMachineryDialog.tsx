@@ -634,8 +634,8 @@ export function ManageMachineryDialog({
           </Button>
         </DialogTrigger>
       )}
-      <DialogContent className="overflow-visible sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-lg">
+        <DialogHeader className="shrink-0">
           <DialogTitle className="font-display">{isEditing ? "Edit movement" : "Manage Machinery"}</DialogTitle>
           <DialogDescription>
             {isEditing ? (
@@ -654,34 +654,54 @@ export function ManageMachineryDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-y-contain pr-1">
           <MotionField label="Movement direction">
             <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-secondary/40 p-1">
               <button
                 type="button"
                 onClick={() => setDirection("in")}
                 className={cn(
-                  "flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold transition-all",
+                  "flex flex-col items-center justify-center gap-0.5 rounded-md px-3 py-2.5 transition-all",
                   direction === "in"
                     ? "bg-emerald-600 text-white shadow-sm"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <ArrowUpFromLine className="h-4 w-4" />
-                OUT
+                <span className="flex items-center gap-1.5 text-sm font-semibold">
+                  <ArrowUpFromLine className="h-4 w-4 shrink-0" />
+                  OUT
+                </span>
+                <span
+                  className={cn(
+                    "text-[10px] font-medium leading-tight",
+                    direction === "in" ? "text-white/85" : "text-muted-foreground",
+                  )}
+                >
+                  (From Store to Site)
+                </span>
               </button>
               <button
                 type="button"
                 onClick={() => setDirection("out")}
                 className={cn(
-                  "flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold transition-all",
+                  "flex flex-col items-center justify-center gap-0.5 rounded-md px-3 py-2.5 transition-all",
                   direction === "out"
                     ? "bg-amber-600 text-white shadow-sm"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <ArrowDownToLine className="h-4 w-4" />
-                IN
+                <span className="flex items-center gap-1.5 text-sm font-semibold">
+                  <ArrowDownToLine className="h-4 w-4 shrink-0" />
+                  IN
+                </span>
+                <span
+                  className={cn(
+                    "text-[10px] font-medium leading-tight",
+                    direction === "out" ? "text-white/85" : "text-muted-foreground",
+                  )}
+                >
+                  (From Site to Store)
+                </span>
               </button>
             </div>
           </MotionField>
@@ -722,11 +742,6 @@ export function ManageMachineryDialog({
                 {SOURCE_OPTIONS.map((opt) => (
                   <SelectItem key={opt.value} value={opt.value}>
                     {opt.label}
-                  </SelectItem>
-                ))}
-                {savedCustomStatuses.map((row) => (
-                  <SelectItem key={row.id} value={customStatusSelectValue(row.label)}>
-                    {row.label}
                   </SelectItem>
                 ))}
                 {isStoreToSite ? (
@@ -785,12 +800,16 @@ export function ManageMachineryDialog({
                       <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent className="z-[100] w-[var(--radix-popover-trigger-width)] p-0" align="start">
-                    <Command>
+                  <PopoverContent className="z-[100] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0" align="start">
+                    <Command className="flex flex-col overflow-hidden">
                       <CommandInput placeholder="Search category…" />
-                      <CommandList>
-                        <CommandEmpty>No category found.</CommandEmpty>
-                        <CommandGroup>
+                      <div
+                        className="max-h-[min(260px,45vh)] overflow-y-auto overscroll-y-contain touch-pan-y"
+                        onWheel={(e) => e.stopPropagation()}
+                      >
+                        <CommandList className="max-h-none overflow-visible">
+                          <CommandEmpty>No category found.</CommandEmpty>
+                          <CommandGroup>
                           {categoryOptions.map((category) => (
                             <CommandItem
                               key={category}
@@ -825,8 +844,9 @@ export function ManageMachineryDialog({
                             />
                             + Add new category
                           </CommandItem>
-                        </CommandGroup>
-                      </CommandList>
+                          </CommandGroup>
+                        </CommandList>
+                      </div>
                     </Command>
                   </PopoverContent>
                 </Popover>
@@ -982,7 +1002,7 @@ export function ManageMachineryDialog({
           ) : null}
         </div>
 
-        <DialogFooter className="gap-2 sm:gap-0">
+        <DialogFooter className="shrink-0 gap-2 border-t border-border pt-4 sm:gap-0">
           <Button type="button" variant="outline" onClick={() => setOpen(false)}>
             Cancel
           </Button>

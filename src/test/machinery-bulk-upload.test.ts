@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { Machine, Site } from "@/domain/types";
 import {
   buildBulkSiteResolutionsAndQueue,
+  existingSiteForBulkWizardConflict,
   findBulkSiteForMachineryImport,
   MACHINERY_BULK_SAMPLE_CSV,
   parseBulkStructural,
@@ -53,6 +54,47 @@ describe("findBulkSiteForMachineryImport", () => {
     const other: Site = { ...siteUpl, id: "s-other", name: "UPL Limited — Panoli Phase 2 Extension" };
     const result = findBulkSiteForMachineryImport([siteUpl, other], "UPL", "Panoli, Gujarat", companyA);
     expect(result.kind).toBe("none");
+  });
+
+  it("treats same name at a different location as a separate site", () => {
+    const result = findBulkSiteForMachineryImport([siteUpl], siteUpl.name, "Dahej, Gujarat", companyA);
+    expect(result.kind).toBe("none");
+  });
+
+  it("matches one of several same-name sites when location matches", () => {
+    const dahej: Site = { ...siteUpl, id: "s-dahej", location: "Dahej, Gujarat" };
+    const result = findBulkSiteForMachineryImport([siteUpl, dahej], siteUpl.name, "Dahej, Gujarat", companyA);
+    expect(result.kind).toBe("exact");
+    if (result.kind === "exact") expect(result.site.id).toBe("s-dahej");
+  });
+});
+
+describe("existingSiteForBulkWizardConflict", () => {
+  it("finds exact deployment when queue was built with stale sites", () => {
+    const pidilite: Site = {
+      ...siteUpl,
+      id: "s-pid",
+      name: "PIDILITE - DAHEJ",
+      location: "ANKLESHWAR GUJARAT",
+    };
+    const resolved = existingSiteForBulkWizardConflict(
+      [pidilite],
+      "PIDILITE - DAHEJ",
+      "ANKLESHWAR GUJARAT",
+      companyA,
+    );
+    expect(resolved?.site.id).toBe("s-pid");
+    expect(resolved?.locationMismatch).toBe(false);
+  });
+
+  it("does not resolve when only the site name matches", () => {
+    const resolved = existingSiteForBulkWizardConflict(
+      [siteUpl],
+      siteUpl.name,
+      "Different CSV location",
+      companyA,
+    );
+    expect(resolved).toBeNull();
   });
 });
 

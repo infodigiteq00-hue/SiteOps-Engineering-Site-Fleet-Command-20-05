@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { format, isValid, parseISO } from "date-fns";
-import { ArrowDownToLine, ArrowUpFromLine, Pencil } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, CheckCircle2, Pencil } from "lucide-react";
 import type { LedgerEntry, Machine } from "@/domain/types";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import {
   classifySiteHistoryEntry,
   isMovementEntry,
+  isSiteClosureHistoryEntry,
   movementDateIso,
   parseGatePassFromSummary,
   resolveMachineryDetails,
@@ -15,12 +16,16 @@ import {
   type SiteHistoryRowType,
 } from "@/lib/site-allocation-history";
 
+type HistoryRowKind = SiteHistoryRowType | "closure" | "site_completed";
+
 type Props = {
   siteId: string;
   ledger: LedgerEntry[];
   machines: Machine[];
   allowEdit?: boolean;
   onEditEntry?: (entry: LedgerEntry) => void;
+  /** Include site-finish / closure ledger rows (for finished-site audit). */
+  includeClosureEvents?: boolean;
 };
 
 function formatHistoryDate(iso: string): string {
@@ -46,23 +51,67 @@ function typeBadge(type: SiteHistoryRowType) {
   );
 }
 
-function rowClassName(type: SiteHistoryRowType): string {
+function rowClassName(type: HistoryRowKind): string {
   if (type === "in") {
     return "border-l-4 border-l-emerald-500 bg-emerald-50/70 hover:bg-emerald-50";
   }
-  return "border-l-4 border-l-amber-500 bg-amber-50/70 hover:bg-amber-50";
+  if (type === "out") {
+    return "border-l-4 border-l-amber-500 bg-amber-50/70 hover:bg-amber-50";
+  }
+  if (type === "site_completed") {
+    return "border-l-4 border-l-primary bg-primary/5 hover:bg-primary/10";
+  }
+  return "border-l-4 border-l-muted-foreground/40 bg-secondary/40 hover:bg-secondary/60";
 }
 
-export function SiteAllocationHistory({ siteId, ledger, machines, allowEdit = false, onEditEntry }: Props) {
+function classifyHistoryRow(entry: LedgerEntry): HistoryRowKind {
+  if (entry.eventKind === "site_marked_completed") return "site_completed";
+  if (entry.eventKind === "machinery_site_closure") return "closure";
+  return classifySiteHistoryEntry(entry);
+}
+
+function historyTypeBadge(type: HistoryRowKind) {
+  if (type === "closure") {
+    return (
+      <Badge className="gap-1 border-border bg-secondary text-foreground hover:bg-secondary">
+        <CheckCircle2 className="h-3 w-3" />
+        Closure
+      </Badge>
+    );
+  }
+  if (type === "site_completed") {
+    return (
+      <Badge className="gap-1 border-primary/30 bg-primary/10 text-primary hover:bg-primary/10">
+        <CheckCircle2 className="h-3 w-3" />
+        Finished
+      </Badge>
+    );
+  }
+  return typeBadge(type);
+}
+
+export function SiteAllocationHistory({
+  siteId,
+  ledger,
+  machines,
+  allowEdit = false,
+  onEditEntry,
+  includeClosureEvents = false,
+}: Props) {
   const entries = useMemo(() => {
-    const movementOnly = ledger.filter((row) => row.siteId === siteId && isMovementEntry(row));
-    return sortSiteHistoryEntries(movementOnly);
-  }, [ledger, siteId]);
+    const siteRows = ledger.filter((row) => row.siteId === siteId);
+    const filtered = includeClosureEvents
+      ? siteRows.filter((row) => isMovementEntry(row) || isSiteClosureHistoryEntry(row))
+      : siteRows.filter((row) => isMovementEntry(row));
+    return sortSiteHistoryEntries(filtered);
+  }, [ledger, siteId, includeClosureEvents]);
 
   return (
     <div>
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
-        <h2 className="font-display text-lg font-semibold">Allocation History</h2>
+        <h2 className="font-display text-lg font-semibold">
+          {includeClosureEvents ? "Site history" : "Allocation History"}
+        </h2>
         {entries.length > 0 && (
           <p className="text-xs text-muted-foreground">
             {entries.length} movement record{entries.length === 1 ? "" : "s"}
@@ -93,14 +142,18 @@ export function SiteAllocationHistory({ siteId, ledger, machines, allowEdit = fa
                 </tr>
               )}
               {entries.map((entry) => {
-                const type = classifySiteHistoryEntry(entry);
+                const type = classifyHistoryRow(entry);
                 const dateIso = movementDateIso(entry);
-                const machinery = resolveMachineryDetails(entry, machines);
+                const machinery =
+                  type === "closure" || type === "site_completed"
+                    ? entry.summary?.trim() || "—"
+                    : resolveMachineryDetails(entry, machines);
                 const gatePass = parseGatePassFromSummary(entry.summary);
+                const canEditRow = allowEdit && isMovementEntry(entry);
 
                 return (
                   <tr key={entry.id} className={cn("border-b border-border last:border-0", rowClassName(type))}>
-                    <td className="px-4 py-3">{typeBadge(type)}</td>
+                    <td className="px-4 py-3">{historyTypeBadge(type)}</td>
                     <td className="whitespace-nowrap px-4 py-3 text-muted-foreground">{formatHistoryDate(dateIso)}</td>
                     <td className="px-4 py-3">
                       <div className="font-medium leading-snug">{machinery}</div>
@@ -125,16 +178,20 @@ export function SiteAllocationHistory({ siteId, ledger, machines, allowEdit = fa
                     <td className="px-4 py-3 text-muted-foreground">{entry.approvedBy || entry.requester || "—"}</td>
                     {allowEdit && (
                       <td className="px-4 py-3 text-right">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="gap-1"
-                          onClick={() => onEditEntry?.(entry)}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                          Edit
-                        </Button>
+                        {canEditRow ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="gap-1"
+                            onClick={() => onEditEntry?.(entry)}
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                            Edit
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">—</span>
+                        )}
                       </td>
                     )}
                   </tr>
@@ -154,6 +211,18 @@ export function SiteAllocationHistory({ siteId, ledger, machines, allowEdit = fa
           <span className="h-2.5 w-2.5 rounded-sm bg-amber-500" />
           Machinery OUT
         </span>
+        {includeClosureEvents && (
+          <>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-sm bg-muted-foreground/50" />
+              Closure
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-sm bg-primary" />
+              Site finished
+            </span>
+          </>
+        )}
       </div>
     </div>
   );

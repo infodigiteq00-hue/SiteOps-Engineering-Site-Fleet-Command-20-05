@@ -32,18 +32,23 @@ export type SiteCategoryReport = {
   category: string;
   machineryLabel: string;
   currentlyOnSite: number;
+  unitType: MachineryUnitType;
   movements: SiteMovementLine[];
 };
 
-/** One table row for export — IN or OUT columns filled per movement line */
+/** One table row for export — IN/OUT columns filled per movement line */
 export type SimpleSiteReportRow = {
   machineryName: string;
-  onSiteToday: number;
-  /** Gate pass + date combined */
-  inDetail: string;
+  /** e.g. "3 nos at site" */
+  onSiteToday: string;
+  /** IN — from site to store */
   inQty: string;
-  outDetail: string;
+  inDate: string;
+  inGatePass: string;
+  /** OUT — from store to site */
   outQty: string;
+  outDate: string;
+  outGatePass: string;
 };
 
 export type SiteReport = {
@@ -63,16 +68,6 @@ function formatReportDate(iso: string): string {
   const parsed = parseISO(iso.includes("T") ? iso : `${iso}T12:00:00`);
   if (!isValid(parsed)) return iso.slice(0, 10) || "—";
   return format(parsed, "dd-MMM-yyyy");
-}
-
-/** Gate pass + date in one cell, e.g. "501 (15-May-2026)" */
-export function formatMovementDetail(gatePass: string, dateLabel: string): string {
-  const gp = gatePass.trim();
-  const hasGp = Boolean(gp && gp !== "—" && gp !== "0");
-  if (!dateLabel && !hasGp) return "";
-  if (!hasGp) return dateLabel;
-  if (!dateLabel) return `GP ${gp}`;
-  return `${gp} (${dateLabel})`;
 }
 
 function displayMachineryName(category: string, label: string): string {
@@ -114,8 +109,21 @@ function unitTypeForEntry(entry: LedgerEntry, machines: Machine[]): MachineryUni
   return linked[0].unitType;
 }
 
-function emptyMovementCells(): Pick<SimpleSiteReportRow, "inDetail" | "inQty" | "outDetail" | "outQty"> {
-  return { inDetail: "", inQty: "", outDetail: "", outQty: "" };
+function emptyMovementCells(): Pick<
+  SimpleSiteReportRow,
+  "inQty" | "inDate" | "inGatePass" | "outQty" | "outDate" | "outGatePass"
+> {
+  return { inQty: "", inDate: "", inGatePass: "", outQty: "", outDate: "", outGatePass: "" };
+}
+
+function gatePassCell(gatePass: string): string {
+  const gp = gatePass.trim();
+  return gp && gp !== "—" ? gp : "";
+}
+
+function formatOnSiteToday(count: number, unitType: MachineryUnitType): string {
+  if (count <= 0) return "—";
+  return `${formatQtyWithUnit(count, unitType)} at site`;
 }
 
 export function buildSimpleReportRows(categories: SiteCategoryReport[]): SimpleSiteReportRow[] {
@@ -127,7 +135,7 @@ export function buildSimpleReportRows(categories: SiteCategoryReport[]): SimpleS
     if (cat.movements.length === 0) {
       rows.push({
         machineryName: name,
-        onSiteToday: cat.currentlyOnSite,
+        onSiteToday: formatOnSiteToday(cat.currentlyOnSite, cat.unitType),
         ...emptyMovementCells(),
       });
       continue;
@@ -136,13 +144,13 @@ export function buildSimpleReportRows(categories: SiteCategoryReport[]): SimpleS
     for (const m of cat.movements) {
       rows.push({
         machineryName: name,
-        onSiteToday: cat.currentlyOnSite,
-        inDetail:
-          m.type === "IN" ? formatMovementDetail(m.gatePass || "—", m.dateLabel) : "",
-        inQty: m.type === "IN" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
-        outDetail:
-          m.type === "OUT" ? formatMovementDetail(m.gatePass || "—", m.dateLabel) : "",
-        outQty: m.type === "OUT" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
+        onSiteToday: formatOnSiteToday(cat.currentlyOnSite, cat.unitType),
+        inQty: m.type === "OUT" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
+        inDate: m.type === "OUT" ? m.dateLabel : "",
+        inGatePass: m.type === "OUT" ? gatePassCell(m.gatePass) : "",
+        outQty: m.type === "IN" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
+        outDate: m.type === "IN" ? m.dateLabel : "",
+        outGatePass: m.type === "IN" ? gatePassCell(m.gatePass) : "",
       });
     }
   }
@@ -189,6 +197,7 @@ export function buildSiteReport(
         category,
         machineryLabel,
         currentlyOnSite: 0,
+        unitType: unitTypeForEntry(entry, machines),
         movements: [],
       } satisfies SiteCategoryReport);
 
@@ -196,14 +205,22 @@ export function buildSiteReport(
     categoryMap.set(lineKey, bucket);
   }
 
-  const onSiteByLine = new Map<string, { count: number; category: string; label: string }>();
+  const onSiteByLine = new Map<
+    string,
+    { count: number; category: string; label: string; unitType: MachineryUnitType }
+  >();
   for (const machine of machines.filter((m) => m.assignedSiteId === site.id)) {
     const key = machineryLineKey(machine);
     const existing = onSiteByLine.get(key);
     if (existing) {
       existing.count += 1;
     } else {
-      onSiteByLine.set(key, { count: 1, category: machine.category, label: machineryGroupLabel(machine) });
+      onSiteByLine.set(key, {
+        count: 1,
+        category: machine.category,
+        label: machineryGroupLabel(machine),
+        unitType: machine.unitType,
+      });
     }
   }
 
@@ -213,9 +230,11 @@ export function buildSiteReport(
       category: info.category,
       machineryLabel: info.label,
       currentlyOnSite: 0,
+      unitType: info.unitType,
       movements: [],
     };
     bucket.currentlyOnSite = info.count;
+    bucket.unitType = info.unitType;
     categoryMap.set(key, bucket);
   }
 

@@ -17,11 +17,11 @@ import {
   bulkGroupParsedRows,
   bulkGroupsToTemplatePreviewRows,
   bulkValidationUniqueCodes,
+  existingSiteForBulkWizardConflict,
   MACHINERY_BULK_SAMPLE_CSV,
   parseBulkStructural,
   siteAssignmentKey,
   siteDeploymentExists,
-  siteNameTakenForCompany,
   type BulkParsedRow,
   type BulkPreviewGroup,
   type BulkSiteConfirmItem,
@@ -43,6 +43,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -95,6 +96,7 @@ export function CreateNewSiteDialog() {
   const [bulkPreview, setBulkPreview] = useState<BulkPreviewGroup[] | null>(null);
   const [bulkResolutions, setBulkResolutions] = useState<Record<string, BulkSiteResolution>>({});
   const [bulkImporting, setBulkImporting] = useState(false);
+  const [bulkImportProgress, setBulkImportProgress] = useState(0);
   const [bulkWizard, setBulkWizard] = useState<BulkWizardState | null>(null);
   const bulkWizardRef = useRef<BulkWizardState | null>(null);
   const [isBulkDragActive, setIsBulkDragActive] = useState(false);
@@ -117,6 +119,34 @@ export function CreateNewSiteDialog() {
 
   const resolvedCompanyId = user.role === "super_admin" ? organisationId || companies[0]?.id || "" : user.companyId ?? "";
 
+  useEffect(() => {
+    if (!bulkWizard || !resolvedCompanyId) return;
+    const item = bulkWizard.queue[bulkWizard.index];
+    if (!item || item.existingSite) return;
+    const resolved = existingSiteForBulkWizardConflict(
+      sites,
+      item.csvProjectName,
+      item.csvLocation,
+      resolvedCompanyId,
+    );
+    if (!resolved) return;
+    setBulkWizard((prev) => {
+      if (!prev || prev.index !== bulkWizard.index) return prev;
+      const current = prev.queue[prev.index];
+      if (!current || current.key !== item.key || current.existingSite) return prev;
+      const queue = prev.queue.map((entry, idx) =>
+        idx === prev.index
+          ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+          : entry,
+      );
+      return {
+        ...prev,
+        queue,
+        ui: wizardUiSeed({ ...current, existingSite: resolved.site }),
+      };
+    });
+  }, [bulkWizard?.index, bulkWizard?.queue, resolvedCompanyId, sites]);
+
   const resetForm = () => {
     setMode("single");
     setForm({ name: "", location: "", machineIds: [] });
@@ -126,6 +156,7 @@ export function CreateNewSiteDialog() {
     setBulkResolutions({});
     setBulkWizard(null);
     setBulkImporting(false);
+    setBulkImportProgress(0);
     setIsBulkDragActive(false);
   };
 
@@ -271,69 +302,80 @@ export function CreateNewSiteDialog() {
     });
   };
 
-  const onBulkConfirm = async () => {
+  const onBulkConfirm = () => {
     if (!bulkPreview?.length || !resolvedCompanyId || bulkImporting) return;
+
+    const groups = bulkPreview;
+    const groupCount = groups.length;
+
     setBulkImporting(true);
-    try {
-      const flatRows = bulkPreview.flatMap((group) =>
-        group.units.map((unit) => ({
-          category: group.category,
-          status: group.status,
-          projectName: unit.projectName,
-          projectLocation: unit.projectLocation,
-          unitType: group.unitType,
-          code: unit.code,
-          name: unit.name,
-        })),
-      );
-      assertBulkImportCodesAreNew(flatRows, machines);
+    setBulkImportProgress(8);
 
-      let added = 0;
-      for (const group of bulkPreview) {
-        const { siteName: _s, existingUnitCount: _e, ...payload } = group;
-        await addMachineryMutation.mutateAsync({
-          category: payload.category,
-          status: payload.status,
-          assignedSiteId: payload.assignedSiteId,
-          companyId: resolvedCompanyId,
-          unitType: payload.unitType,
-          units: payload.units,
-          ledgerImportTag: "bulk_csv",
-        });
-        added += payload.units.length;
-      }
-
+    void (async () => {
       try {
-        await appendAuditLedgerEntry({
-          companyId: resolvedCompanyId,
-          eventKind: "bulk_upload_completed",
-          summary: `Bulk sites CSV import finished: machinery added for ${Object.keys(bulkResolutions).length} deployment(s), ${added} new unit(s). Existing fleet unchanged.`,
-          siteId: null,
-          machineIds: [],
-          requester: user.name,
-          approvedBy: user.name,
-          approverRole: ROLE_LABELS[user.role],
-          totalUnits: added,
-        });
-      } catch (err) {
-        console.warn("[ledger] bulk sites summary skipped", err);
-      }
+        const flatRows = groups.flatMap((group) =>
+          group.units.map((unit) => ({
+            category: group.category,
+            status: group.status,
+            projectName: unit.projectName,
+            projectLocation: unit.projectLocation,
+            unitType: group.unitType,
+            code: unit.code,
+            name: unit.name,
+          })),
+        );
+        assertBulkImportCodesAreNew(flatRows, machines);
 
-      toast({
-        title: "Import complete",
-        description: `${added} new machinery unit(s) added. Sites were created or matched during preview; existing machinery was not changed.`,
-      });
-      setOpen(false);
-      resetForm();
-    } catch (err) {
-      toast({
-        title: "Import stopped",
-        description: err instanceof Error ? err.message : "Try again.",
-        variant: "destructive",
-      });
-    } finally {
-      setBulkImporting(false);
-    }
+        let added = 0;
+        for (let i = 0; i < groups.length; i++) {
+          const group = groups[i];
+          const { siteName: _s, existingUnitCount: _e, ...payload } = group;
+          await addMachineryMutation.mutateAsync({
+            category: payload.category,
+            status: payload.status,
+            assignedSiteId: payload.assignedSiteId,
+            companyId: resolvedCompanyId,
+            unitType: payload.unitType,
+            units: payload.units,
+            ledgerImportTag: "bulk_csv",
+          });
+          added += payload.units.length;
+          setBulkImportProgress(Math.round(((i + 1) / groupCount) * 100));
+        }
+
+        try {
+          await appendAuditLedgerEntry({
+            companyId: resolvedCompanyId,
+            eventKind: "bulk_upload_completed",
+            summary: `Bulk sites CSV import finished: machinery added for ${Object.keys(bulkResolutions).length} deployment(s), ${added} new unit(s). Existing fleet unchanged.`,
+            siteId: null,
+            machineIds: [],
+            requester: user.name,
+            approvedBy: user.name,
+            approverRole: ROLE_LABELS[user.role],
+            totalUnits: added,
+          });
+        } catch (err) {
+          console.warn("[ledger] bulk sites summary skipped", err);
+        }
+
+        toast({
+          title: "Import complete",
+          description: `${added} new machinery unit(s) added. Sites were created or matched during preview; existing machinery was not changed.`,
+        });
+        setOpen(false);
+        resetForm();
+      } catch (err) {
+        toast({
+          title: "Import stopped",
+          description: err instanceof Error ? err.message : "Try again.",
+          variant: "destructive",
+        });
+      } finally {
+        setBulkImporting(false);
+        setBulkImportProgress(0);
+      }
+    })();
   };
 
   const loadBulkFile = async (file: File) => {
@@ -428,10 +470,19 @@ export function CreateNewSiteDialog() {
       toast({ title: "No company", description: "Pick a company before creating a site.", variant: "destructive" });
       return;
     }
-    if (
-      siteDeploymentExists(sites, trimmed, location, resolvedCompanyId, wiz.pendingNormNames) ||
-      siteNameTakenForCompany(trimmed, resolvedCompanyId, sites, wiz.pendingNormNames)
-    ) {
+    if (siteDeploymentExists(sites, trimmed, location, resolvedCompanyId, wiz.pendingNormNames)) {
+      const resolved = existingSiteForBulkWizardConflict(sites, trimmed, location, resolvedCompanyId);
+      if (resolved) {
+        setBulkWizard((prev) => {
+          if (!prev || prev.index !== wiz.index) return prev;
+          const queue = prev.queue.map((entry, idx) =>
+            idx === prev.index
+              ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+              : entry,
+          );
+          return { ...prev, queue, ui: { mode: "case2-choice", nameDraft: trimmed } };
+        });
+      }
       toast({
         title: "Site already exists",
         description: `"${trimmed}" at "${location}" already exists. Use "Use existing site" or choose a different name.`,
@@ -620,6 +671,17 @@ export function CreateNewSiteDialog() {
                   <p className="text-xs text-muted-foreground">
                     Same 6-column template as Add machinery. Confirm to add new units; existing machinery is not changed.
                   </p>
+                  {bulkImporting ? (
+                    <div className="space-y-2 rounded-md border border-border bg-muted/40 p-3">
+                      <p className="text-sm font-medium">Uploading machinery…</p>
+                      <p className="text-xs text-muted-foreground">
+                        Your import is confirmed. The system is adding {bulkPreview.reduce((n, g) => n + g.units.length, 0)} unit
+                        {bulkPreview.reduce((n, g) => n + g.units.length, 0) === 1 ? "" : "s"} in the background — please keep this window open.
+                      </p>
+                      <Progress value={bulkImportProgress} className="h-2" />
+                      <p className="text-right text-xs tabular-nums text-muted-foreground">{bulkImportProgress}%</p>
+                    </div>
+                  ) : null}
                   <div className="max-h-56 overflow-auto rounded-md border border-border">
                     <table className="min-w-[720px] text-xs">
                       <thead className="sticky top-0 border-b border-border bg-secondary/60 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -725,13 +787,13 @@ export function CreateNewSiteDialog() {
               <DialogFooter>
                 {bulkPreview ? (
                   <>
-                    <Button type="button" variant="outline" onClick={() => setBulkPreview(null)}>
+                    <Button type="button" variant="outline" disabled={bulkImporting} onClick={() => setBulkPreview(null)}>
                       Back to file
                     </Button>
-                    <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+                    <Button type="button" variant="outline" disabled={bulkImporting} onClick={() => setOpen(false)}>
                       Cancel
                     </Button>
-                    <Button type="button" onClick={() => void onBulkConfirm()} disabled={bulkImporting || addMachineryMutation.isPending}>
+                    <Button type="button" onClick={onBulkConfirm} disabled={bulkImporting}>
                       {bulkImporting ? "Importing…" : "Confirm & import"}
                     </Button>
                   </>

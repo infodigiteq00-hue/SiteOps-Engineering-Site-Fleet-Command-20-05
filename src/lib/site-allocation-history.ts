@@ -31,6 +31,10 @@ export function isMovementEntry(entry: LedgerEntry): boolean {
   return entry.eventKind === "machinery_moved_in" || entry.eventKind === "machinery_moved_out";
 }
 
+export function isSiteClosureHistoryEntry(entry: LedgerEntry): boolean {
+  return entry.eventKind === "machinery_site_closure" || entry.eventKind === "site_marked_completed";
+}
+
 export function parseGatePassFromSummary(summary?: string): string {
   if (!summary) return "—";
   const match = summary.match(/Gate pass\s+([^·]+?)(?:\s*·|\s*\.?\s*$)/i);
@@ -114,7 +118,19 @@ const RESERVED_SOURCE_POOL_LABELS = new Set([
   "maintenance",
   "lost_damaged",
   "lost/damaged",
+  NEW_MACHINES_POOL_LABEL.toLowerCase(),
 ]);
+
+/** Built-in Manage Machinery dropdown labels — never persisted as custom company rows. */
+export function isFixedMachinerySourceOptionLabel(label: string): boolean {
+  const lower = label.trim().toLowerCase();
+  return (
+    lower === "available" ||
+    lower === "assigned" ||
+    lower === "maintenance" ||
+    lower === NEW_MACHINES_POOL_LABEL.toLowerCase()
+  );
+}
 
 export function isReservedSourcePoolLabel(label: string): boolean {
   return RESERVED_SOURCE_POOL_LABELS.has(label.trim().toLowerCase());

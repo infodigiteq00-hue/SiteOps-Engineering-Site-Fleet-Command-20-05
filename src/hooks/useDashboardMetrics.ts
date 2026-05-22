@@ -21,6 +21,8 @@ export function useDashboardMetrics() {
     const activeSitesList = sites.filter((site) => site.status !== "completed");
     const finishedSitesList = sites.filter((site) => site.status === "completed");
     const assigned = machines.filter((machine) => machine.status === "assigned").length;
+    const available = machines.filter((machine) => machine.status === "available").length;
+    const lostDamaged = machines.filter((machine) => machine.status === "lost_damaged").length;
     const totalMachines = machines.length;
     const pending = requests.filter((request) => request.status === "pending").length;
 
@@ -31,6 +33,8 @@ export function useDashboardMetrics() {
       activeSitesList,
       finishedSitesList,
       assigned,
+      available,
+      lostDamaged,
       totalMachines,
       pending,
       ledgerEntries: ledger.length,

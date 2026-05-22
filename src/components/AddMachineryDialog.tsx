@@ -41,11 +41,11 @@ import {
   bulkGroupParsedRows,
   bulkGroupsToTemplatePreviewRows,
   bulkValidationUniqueCodes,
+  existingSiteForBulkWizardConflict,
   MACHINERY_BULK_SAMPLE_CSV,
   parseBulkStructural,
   siteAssignmentKey,
   siteDeploymentExists,
-  siteNameTakenForCompany,
   type BulkParsedRow,
   type BulkPreviewGroup,
   type BulkSiteConfirmItem,
@@ -147,6 +147,34 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   useEffect(() => {
     bulkWizardRef.current = bulkWizard;
   }, [bulkWizard]);
+
+  useEffect(() => {
+    if (!bulkWizard || !bulkOwnerCompanyId) return;
+    const item = bulkWizard.queue[bulkWizard.index];
+    if (!item || item.existingSite) return;
+    const resolved = existingSiteForBulkWizardConflict(
+      sites,
+      item.csvProjectName,
+      item.csvLocation,
+      bulkOwnerCompanyId,
+    );
+    if (!resolved) return;
+    setBulkWizard((prev) => {
+      if (!prev || prev.index !== bulkWizard.index) return prev;
+      const current = prev.queue[prev.index];
+      if (!current || current.key !== item.key || current.existingSite) return prev;
+      const queue = prev.queue.map((entry, idx) =>
+        idx === prev.index
+          ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+          : entry,
+      );
+      return {
+        ...prev,
+        queue,
+        ui: wizardUiSeed({ ...current, existingSite: resolved.site }),
+      };
+    });
+  }, [bulkWizard?.index, bulkWizard?.queue, bulkOwnerCompanyId, sites]);
 
   useEffect(() => {
     if (form.status !== "assigned" || sitesForAssignment.length === 0) return;
@@ -649,10 +677,19 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     }
 
     const location = item.csvLocation.trim();
-    if (
-      siteDeploymentExists(sites, trimmed, location, ownerCompanyId, wiz.pendingNormNames) ||
-      siteNameTakenForCompany(trimmed, ownerCompanyId, sites, wiz.pendingNormNames)
-    ) {
+    if (siteDeploymentExists(sites, trimmed, location, ownerCompanyId, wiz.pendingNormNames)) {
+      const resolved = existingSiteForBulkWizardConflict(sites, trimmed, location, ownerCompanyId);
+      if (resolved) {
+        setBulkWizard((prev) => {
+          if (!prev || prev.index !== wiz.index) return prev;
+          const queue = prev.queue.map((entry, idx) =>
+            idx === prev.index
+              ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+              : entry,
+          );
+          return { ...prev, queue, ui: { mode: "case2-choice", nameDraft: trimmed } };
+        });
+      }
       toast({
         title: "Site already exists",
         description: `"${trimmed}" at "${location}" is already in your directory. Choose "Use existing site" to add machinery there, or enter a different site name.`,

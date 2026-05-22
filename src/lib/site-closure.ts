@@ -1,4 +1,6 @@
 import type { Machine, Site } from "@/domain/types";
+import type { MachineryUnitType } from "@/lib/machinery-unit-types";
+import { formatQtyWithUnit, normalizeMachineryUnitType } from "@/lib/machinery-unit-types";
 
 export type SiteClosureAction = "available" | "maintenance" | "relocate" | "lost_damaged";
 
@@ -12,10 +14,36 @@ export type SiteClosureGroup = {
   key: string;
   label: string;
   category: string;
+  unitType: MachineryUnitType;
   machineIds: string[];
   units: SiteClosureUnit[];
   count: number;
 };
+
+/** Max remainder units shown one-by-one; above this, one action applies to all remaining units. */
+export const SITE_CLOSURE_DETAILED_REMAINDER_MAX = 10;
+
+/** Strip trailing unit numbers so "Ladder 1" and "Ladder 2" group together. */
+export function machineryNameGroupKey(name: string): string {
+  const trimmed = name.trim();
+  const match = trimmed.match(/^(.*?)(\d+)\s*$/);
+  return match ? match[1].trimEnd() : trimmed;
+}
+
+export function machineryGroupDisplayLabel(nameGroupKey: string, category: string): string {
+  const base = nameGroupKey.trim();
+  if (base.length > 0) return base;
+  return category;
+}
+
+export function usesContinuousQuantity(unitType: MachineryUnitType | string): boolean {
+  const unit = normalizeMachineryUnitType(unitType);
+  return unit !== "nos" && unit !== "set" && unit !== "pair" && unit !== "box";
+}
+
+export function formatSiteClosureGroupQty(count: number, unitType: MachineryUnitType | string): string {
+  return formatQtyWithUnit(count, unitType) || String(count);
+}
 
 export type SiteClosureDisposition = {
   machineIds: string[];
@@ -43,15 +71,24 @@ export function groupSiteMachinery(machines: Machine[], siteId: string): SiteClo
   const atSite = machines.filter((m) => m.assignedSiteId === siteId);
   const grouped = new Map<
     string,
-    { label: string; category: string; machineIds: string[]; units: SiteClosureUnit[] }
+    {
+      label: string;
+      category: string;
+      unitType: MachineryUnitType;
+      machineIds: string[];
+      units: SiteClosureUnit[];
+    }
   >();
   const sorted = [...atSite].sort((a, b) => a.code.localeCompare(b.code));
 
   for (const machine of sorted) {
-    const key = `${machine.name}::${machine.category}`;
+    const nameKey = machineryNameGroupKey(machine.name);
+    const unitType = normalizeMachineryUnitType(machine.unitType);
+    const key = `${nameKey}::${machine.category}::${unitType}`;
     const entry = grouped.get(key) ?? {
-      label: machine.name,
+      label: machineryGroupDisplayLabel(nameKey, machine.category),
       category: machine.category,
+      unitType,
       machineIds: [],
       units: [],
     };
@@ -64,6 +101,7 @@ export function groupSiteMachinery(machines: Machine[], siteId: string): SiteClo
     key,
     label: entry.label,
     category: entry.category,
+    unitType: entry.unitType,
     machineIds: entry.machineIds,
     units: entry.units,
     count: entry.machineIds.length,
@@ -213,17 +251,36 @@ export const CLOSURE_ACTION_SIMPLE: Record<SiteClosureAction, string> = {
 export type SimpleClosureGroupState = {
   /** Units returning to the company pool as available */
   availableCount: number;
-  /** What happens to the remaining units (when availableCount < total) */
+  /** Per-unit disposition for remainder (when count is small enough to show individually) */
+  remainderByUnitId: Record<string, ClosureUnitState>;
+  /** Bulk action for all remainder units when the group is large */
   otherAction: SiteClosureAction;
   relocateSiteId: string;
   remarks: string;
 };
+
+function defaultRemainderUnitStates(group: SiteClosureGroup): Record<string, ClosureUnitState> {
+  const states: Record<string, ClosureUnitState> = {};
+  for (const unit of group.units) {
+    states[unit.id] = { ...defaultUnitState(), action: "lost_damaged" };
+  }
+  return states;
+}
+
+export function remainderUnitsForGroup(group: SiteClosureGroup, availableCount: number): SiteClosureUnit[] {
+  return group.units.slice(Math.max(0, Math.min(availableCount, group.count)));
+}
+
+export function usesDetailedRemainderClosure(restCount: number): boolean {
+  return restCount > 0 && restCount <= SITE_CLOSURE_DETAILED_REMAINDER_MAX;
+}
 
 export function initialSimpleClosureState(groups: SiteClosureGroup[]): Record<string, SimpleClosureGroupState> {
   const state: Record<string, SimpleClosureGroupState> = {};
   for (const group of groups) {
     state[group.key] = {
       availableCount: group.count,
+      remainderByUnitId: defaultRemainderUnitStates(group),
       otherAction: "lost_damaged",
       relocateSiteId: "",
       remarks: "",
@@ -232,10 +289,20 @@ export function initialSimpleClosureState(groups: SiteClosureGroup[]): Record<st
   return state;
 }
 
-export function simpleClosureStateValid(state: SimpleClosureGroupState, total: number): boolean {
+export function simpleClosureStateValid(
+  state: SimpleClosureGroupState,
+  total: number,
+  group?: SiteClosureGroup,
+): boolean {
   if (state.availableCount < 0 || state.availableCount > total) return false;
   const rest = total - state.availableCount;
   if (rest === 0) return true;
+  if (usesDetailedRemainderClosure(rest) && group) {
+    const remainderUnits = remainderUnitsForGroup(group, state.availableCount);
+    return remainderUnits.every((unit) =>
+      closureUnitStateValid(state.remainderByUnitId[unit.id] ?? defaultUnitState()),
+    );
+  }
   return closureUnitStateValid({
     action: state.otherAction,
     relocateSiteId: state.relocateSiteId,
@@ -257,23 +324,57 @@ export function simpleStateToQtyLines(
     });
   }
   const rest = group.count - state.availableCount;
-  if (rest > 0) {
-    lines.push({
-      qty: rest,
-      action: state.otherAction,
-      relocateSiteId: state.otherAction === "relocate" ? state.relocateSiteId : "",
-      remarks: state.otherAction === "lost_damaged" ? state.remarks : "",
-    });
+  if (rest <= 0) return lines;
+
+  if (usesDetailedRemainderClosure(rest)) {
+    const remainderUnits = remainderUnitsForGroup(group, state.availableCount);
+    const buckets = new Map<string, ClosureQtyLine>();
+    for (const unit of remainderUnits) {
+      const unitState = state.remainderByUnitId[unit.id] ?? defaultUnitState();
+      const bucketKey = `${unitState.action}::${unitState.relocateSiteId}::${unitState.remarks.trim()}`;
+      const existing = buckets.get(bucketKey);
+      if (existing) {
+        existing.qty += 1;
+      } else {
+        buckets.set(bucketKey, { qty: 1, ...unitState });
+      }
+    }
+    lines.push(...buckets.values());
+    return lines;
   }
+
+  lines.push({
+    qty: rest,
+    action: state.otherAction,
+    relocateSiteId: state.otherAction === "relocate" ? state.relocateSiteId : "",
+    remarks: state.otherAction === "lost_damaged" ? state.remarks : "",
+  });
   return lines;
 }
 
-export function summarizeSimpleClosure(state: SimpleClosureGroupState, total: number): string {
+export function summarizeSimpleClosure(
+  state: SimpleClosureGroupState,
+  total: number,
+  unitType?: MachineryUnitType | string,
+  group?: SiteClosureGroup,
+): string {
+  const qty = (n: number) => (unitType ? formatSiteClosureGroupQty(n, unitType) : String(n));
   const rest = total - state.availableCount;
-  if (rest === 0) return `All ${total} back in pool`;
+  if (rest === 0) return `All ${qty(total)} back in pool`;
+  if (usesDetailedRemainderClosure(rest) && group) {
+    const remainderUnits = remainderUnitsForGroup(group, state.availableCount);
+    const items = remainderUnits.map(
+      (unit) => state.remainderByUnitId[unit.id]?.action ?? "lost_damaged",
+    );
+    const detail = summarizeClosureActions(
+      items.map((action) => ({ action, qty: 1 })),
+    );
+    if (state.availableCount === 0) return detail;
+    return `${qty(state.availableCount)} in pool · remainder: ${detail}`;
+  }
   if (state.availableCount === 0) {
-    return `${total} → ${CLOSURE_ACTION_SIMPLE[state.otherAction].toLowerCase()}`;
+    return `${qty(total)} → ${CLOSURE_ACTION_SIMPLE[state.otherAction].toLowerCase()}`;
   }
   const other = CLOSURE_ACTION_SIMPLE[state.otherAction].toLowerCase();
-  return `${state.availableCount} in pool, ${rest} ${other}`;
+  return `${qty(state.availableCount)} in pool, ${qty(rest)} ${other}`;
 }

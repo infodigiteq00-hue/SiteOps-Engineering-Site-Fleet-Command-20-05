@@ -5,12 +5,17 @@ import { cn } from "@/lib/utils";
 import {
   CLOSURE_ACTION_SIMPLE,
   buildDispositionsFromQtyLines,
+  formatSiteClosureGroupQty,
   groupSiteMachinery,
   initialSimpleClosureState,
+  remainderUnitsForGroup,
   relocationSiteOptions,
   simpleClosureStateValid,
   simpleStateToQtyLines,
   summarizeSimpleClosure,
+  usesContinuousQuantity,
+  usesDetailedRemainderClosure,
+  type ClosureUnitState,
   type SimpleClosureGroupState,
   type SiteClosureAction,
 } from "@/lib/site-closure";
@@ -28,6 +33,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "@/hooks/use-toast";
+import { formatMutationError } from "@/lib/mutation-errors";
 
 type Props = {
   site: Site;
@@ -76,16 +82,16 @@ function QtyStepper({
   );
 }
 
-function OtherActionExtras({
+function UnitActionExtras({
   state,
   onChange,
   relocateTargets,
 }: {
-  state: SimpleClosureGroupState;
-  onChange: (patch: Partial<SimpleClosureGroupState>) => void;
+  state: ClosureUnitState;
+  onChange: (patch: Partial<ClosureUnitState>) => void;
   relocateTargets: Site[];
 }) {
-  if (state.otherAction === "relocate") {
+  if (state.action === "relocate") {
     return (
       <div className="space-y-1.5">
         <Label className="text-sm">Which site?</Label>
@@ -109,7 +115,7 @@ function OtherActionExtras({
       </div>
     );
   }
-  if (state.otherAction === "lost_damaged") {
+  if (state.action === "lost_damaged") {
     return (
       <div className="space-y-1.5">
         <Label className="text-sm">Note (optional)</Label>
@@ -126,22 +132,82 @@ function OtherActionExtras({
   return null;
 }
 
-function OtherActionPick({
+function OtherActionExtras({
   state,
   onChange,
   relocateTargets,
-  restCount,
 }: {
   state: SimpleClosureGroupState;
   onChange: (patch: Partial<SimpleClosureGroupState>) => void;
   relocateTargets: Site[];
-  restCount: number;
+}) {
+  return (
+    <UnitActionExtras
+      state={{
+        action: state.otherAction,
+        relocateSiteId: state.relocateSiteId,
+        remarks: state.remarks,
+      }}
+      onChange={(patch) => onChange(patch)}
+      relocateTargets={relocateTargets}
+    />
+  );
+}
+
+function RemainderUnitRow({
+  unitLabel,
+  state,
+  onChange,
+  relocateTargets,
+}: {
+  unitLabel: string;
+  state: ClosureUnitState;
+  onChange: (patch: Partial<ClosureUnitState>) => void;
+  relocateTargets: Site[];
+}) {
+  return (
+    <div className="space-y-2 rounded-lg border border-border/80 bg-secondary/20 p-3">
+      <p className="text-xs font-medium text-foreground">{unitLabel}</p>
+      <Select
+        value={state.action}
+        onValueChange={(v) =>
+          onChange({
+            action: v as SiteClosureAction,
+            relocateSiteId: "",
+            remarks: "",
+          })
+        }
+      >
+        <SelectTrigger className="h-9 bg-background text-sm">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {(["maintenance", "relocate", "lost_damaged"] as SiteClosureAction[]).map((action) => (
+            <SelectItem key={action} value={action}>
+              {CLOSURE_ACTION_SIMPLE[action]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <UnitActionExtras state={state} onChange={onChange} relocateTargets={relocateTargets} />
+    </div>
+  );
+}
+
+function OtherActionPick({
+  state,
+  onChange,
+  relocateTargets,
+  restLabel,
+}: {
+  state: SimpleClosureGroupState;
+  onChange: (patch: Partial<SimpleClosureGroupState>) => void;
+  relocateTargets: Site[];
+  restLabel: string;
 }) {
   return (
     <div className="space-y-3 rounded-lg border border-amber-200/80 bg-amber-50/50 p-4">
-      <p className="text-sm font-medium text-amber-950">
-        The other {restCount} unit{restCount === 1 ? "" : "s"} — what happened?
-      </p>
+      <p className="text-sm font-medium text-amber-950">The other {restLabel} — what happened?</p>
       <Select
         value={state.otherAction}
         onValueChange={(v) =>
@@ -183,20 +249,50 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
   }, [open, groups]);
 
   const updateGroup = (key: string, patch: Partial<SimpleClosureGroupState>) => {
-    setGroupState((prev) => ({
-      ...prev,
-      [key]: {
-        availableCount: 0,
-        otherAction: "lost_damaged",
-        relocateSiteId: "",
-        remarks: "",
-        ...prev[key],
-        ...patch,
-      },
-    }));
+    setGroupState((prev) => {
+      const group = groups.find((g) => g.key === key);
+      const prior = prev[key] ?? (group ? initialSimpleClosureState([group])[key] : undefined);
+      if (!prior) return prev;
+      return {
+        ...prev,
+        [key]: {
+          ...prior,
+          ...patch,
+          ...(patch.remainderByUnitId
+            ? { remainderByUnitId: { ...prior.remainderByUnitId, ...patch.remainderByUnitId } }
+            : {}),
+        },
+      };
+    });
   };
 
-  const allValid = groups.every((g) => simpleClosureStateValid(groupState[g.key] ?? initialSimpleClosureState([g])[g.key], g.count));
+  const updateRemainderUnit = (groupKey: string, unitId: string, patch: Partial<ClosureUnitState>) => {
+    setGroupState((prev) => {
+      const prior = prev[groupKey];
+      if (!prior) return prev;
+      return {
+        ...prev,
+        [groupKey]: {
+          ...prior,
+          remainderByUnitId: {
+            ...prior.remainderByUnitId,
+            [unitId]: {
+              action: "lost_damaged",
+              relocateSiteId: "",
+              remarks: "",
+              ...prior.remainderByUnitId[unitId],
+              ...patch,
+            },
+          },
+        },
+      };
+    });
+  };
+
+  const allValid = groups.every((g) => {
+    const state = groupState[g.key] ?? initialSimpleClosureState([g])[g.key];
+    return simpleClosureStateValid(state, g.count, g);
+  });
 
   const handleComplete = () => {
     if (!allValid) {
@@ -209,7 +305,7 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
     }
 
     const dispositions = groups.flatMap((group) => {
-      const state = groupState[group.key];
+      const state = groupState[group.key] ?? initialSimpleClosureState([group])[group.key];
       const lines = simpleStateToQtyLines(group, state);
       return buildDispositionsFromQtyLines([group], { [group.key]: lines });
     });
@@ -232,7 +328,7 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
         onError: (err) => {
           toast({
             title: "Could not finish site",
-            description: err instanceof Error ? err.message : "Try again.",
+            description: formatMutationError(err),
             variant: "destructive",
           });
         },
@@ -246,8 +342,8 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
         <DialogHeader>
           <DialogTitle className="font-display">Finish site — {site.name}</DialogTitle>
           <DialogDescription>
-            Say what happened to each machinery type. Usually everything goes back to the company pool — you only
-            change it when something else happened.
+            Grouped by machinery type — set how many came back to the pool, then only fill in details for the rest.
+            Usually everything returns; change it only when something else happened.
           </DialogDescription>
         </DialogHeader>
 
@@ -268,7 +364,11 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
                   groupState[group.key] ??
                   initialSimpleClosureState([group])[group.key];
                 const rest = group.count - state.availableCount;
-                const summary = summarizeSimpleClosure(state, group.count);
+                const summary = summarizeSimpleClosure(state, group.count, group.unitType, group);
+                const continuous = usesContinuousQuantity(group.unitType);
+                const atSiteQty = formatSiteClosureGroupQty(group.count, group.unitType);
+                const remainderUnits = remainderUnitsForGroup(group, state.availableCount);
+                const detailedRemainder = usesDetailedRemainderClosure(rest);
 
                 return (
                   <div
@@ -281,14 +381,14 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
                     <div>
                       <h4 className="font-medium leading-snug">{group.label}</h4>
                       <p className="text-xs text-muted-foreground">
-                        {group.category} · {group.count} unit{group.count === 1 ? "" : "s"} at this site
+                        {group.category} · {atSiteQty} at this site
                       </p>
                       <p className="mt-1 text-xs text-muted-foreground">{summary}</p>
                     </div>
 
                     {group.count === 1 ? (
                       <div className="space-y-2">
-                        <Label className="text-sm">What happens to this unit?</Label>
+                        <Label className="text-sm">What happens to this {continuous ? group.unitType : "unit"}?</Label>
                         <Select
                           value={state.availableCount === 1 ? "available" : state.otherAction}
                           onValueChange={(v) => {
@@ -324,8 +424,14 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
                     ) : (
                       <>
                         <div className="space-y-2">
-                          <Label className="text-sm">How many came back to the company pool?</Label>
-                          <p className="text-xs text-muted-foreground">Use − and + to adjust. Most of the time this is all of them.</p>
+                          <Label className="text-sm">
+                            {continuous
+                              ? `How much came back to the company pool?`
+                              : "How many came back to the company pool?"}
+                          </Label>
+                          <p className="text-xs text-muted-foreground">
+                            Use − and + (max {atSiteQty}). Most of the time this is all of them.
+                          </p>
                           <QtyStepper
                             value={state.availableCount}
                             max={group.count}
@@ -333,12 +439,37 @@ export function SiteFinishWorkflowDialog({ site, machines, sites, open, onOpenCh
                           />
                         </div>
 
-                        {rest > 0 && (
+                        {rest > 0 && detailedRemainder && (
+                          <div className="space-y-3 rounded-lg border border-amber-200/80 bg-amber-50/50 p-4">
+                            <p className="text-sm font-medium text-amber-950">
+                              The other {formatSiteClosureGroupQty(rest, group.unitType)} — what happened?
+                            </p>
+                            <div className="space-y-2">
+                              {remainderUnits.map((unit) => (
+                                <RemainderUnitRow
+                                  key={unit.id}
+                                  unitLabel={unit.name}
+                                  state={
+                                    state.remainderByUnitId[unit.id] ?? {
+                                      action: "lost_damaged",
+                                      relocateSiteId: "",
+                                      remarks: "",
+                                    }
+                                  }
+                                  onChange={(patch) => updateRemainderUnit(group.key, unit.id, patch)}
+                                  relocateTargets={relocateTargets}
+                                />
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {rest > 0 && !detailedRemainder && (
                           <OtherActionPick
                             state={state}
                             onChange={(patch) => updateGroup(group.key, patch)}
                             relocateTargets={relocateTargets}
-                            restCount={rest}
+                            restLabel={formatSiteClosureGroupQty(rest, group.unitType)}
                           />
                         )}
                       </>

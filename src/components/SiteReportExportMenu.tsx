@@ -80,7 +80,7 @@ export function SiteReportExportMenu({ site, ledger, machines }: Props) {
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <p className="px-2 py-1.5 text-[10px] leading-snug text-muted-foreground">
-          Simple table: machinery, on-site count, IN/OUT with gate pass &amp; date
+          Simple table: machinery, on-site count, IN/OUT with qty, date, and gate pass
         </p>
       </DropdownMenuContent>
     </DropdownMenu>

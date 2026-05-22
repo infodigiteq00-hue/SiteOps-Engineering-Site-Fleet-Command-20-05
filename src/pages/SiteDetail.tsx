@@ -16,6 +16,8 @@ import { useUpdateMachineMutation } from "@/hooks/useOperationalData";
 import { ManageMachineryDialog } from "@/components/ManageMachineryDialog";
 import { SiteAllocationHistory } from "@/components/SiteAllocationHistory";
 import { SiteClosureReport } from "@/components/SiteClosureReport";
+import { SiteClosureMachineryArchive } from "@/components/SiteClosureMachineryArchive";
+import { buildSiteClosureArchive } from "@/lib/site-closure-archive";
 import { SiteReportExportMenu } from "@/components/SiteReportExportMenu";
 import { resolveSiteClosureSummary } from "@/lib/site-closure-summary";
 
@@ -42,6 +44,10 @@ const SiteDetail = () => {
   const closureSummary = useMemo(
     () => (site ? resolveSiteClosureSummary(site, ledger) : null),
     [site, ledger],
+  );
+  const closureArchive = useMemo(
+    () => (site && site.status === "completed" ? buildSiteClosureArchive(site.id, ledger, machines) : []),
+    [site, ledger, machines],
   );
 
   if (!site) return <div className="text-muted-foreground">Site not found.</div>;
@@ -136,7 +142,7 @@ const SiteDetail = () => {
           </div>
           <StatusBadge status={site.status} />
         </div>
-        {!isFinished && (
+        {!isFinished ? (
           <div className="mt-5">
             <div className="flex justify-between text-xs text-primary-foreground/70">
               <span>Percentage Deployment ({assigned.length} of {machines.length} units)</span>
@@ -146,7 +152,15 @@ const SiteDetail = () => {
               <div className="h-full bg-gradient-accent" style={{ width: `${deployment}%` }} />
             </div>
           </div>
-        )}
+        ) : closureSummary ? (
+          <div className="mt-5 rounded-lg border border-primary-foreground/20 bg-primary-foreground/10 px-4 py-3 text-sm">
+            <span className="font-medium">Site finished</span>
+            <span className="text-primary-foreground/80">
+              {" "}
+              · {closureSummary.totalUnits} unit{closureSummary.totalUnits === 1 ? "" : "s"} processed at closure
+            </span>
+          </div>
+        ) : null}
       </div>
 
       {isFinished && closureSummary && (
@@ -158,14 +172,30 @@ const SiteDetail = () => {
 
       {isFinished && !closureSummary && (
         <div className="rounded-xl border border-dashed border-border bg-card p-6 text-center text-sm text-muted-foreground">
-          No closure breakdown was saved for this site. Check allocation history below for movement records.
+          Closure totals were not saved on the site record. Machinery outcomes and movements below are still available
+          for audit.
+        </div>
+      )}
+
+      {isFinished && closureArchive.length > 0 && (
+        <div>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="font-display text-lg font-semibold">
+              Machinery at closure
+              <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-muted-foreground">
+                {closureArchive.length}
+              </span>
+            </h2>
+            <p className="text-xs text-muted-foreground">Read-only snapshot for future audit</p>
+          </div>
+          <SiteClosureMachineryArchive siteId={site.id} ledger={ledger} machines={machines} />
         </div>
       )}
 
       <div>
         <div className="mb-3 flex items-center justify-between">
           <h2 className="font-display text-lg font-semibold">
-            {isFinished ? "Closure history" : "Assigned Machinery"}
+            {isFinished ? "Site history" : "Assigned Machinery"}
             {!isFinished && (
               <span className="ml-2 rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-muted-foreground">
                 {assigned.length}
@@ -191,15 +221,7 @@ const SiteDetail = () => {
             )}
           </div>
         </div>
-        {isFinished ? (
-          <SiteAllocationHistory
-            siteId={site.id}
-            ledger={ledger}
-            machines={machines}
-            allowEdit={allowMachineryEdit}
-            onEditEntry={openManageMovement}
-          />
-        ) : assigned.length === 0 ? (
+        {isFinished ? null : assigned.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border bg-card p-8 text-center text-sm text-muted-foreground">
             <Wrench className="mx-auto mb-2 h-6 w-6 opacity-40" />
             No machinery assigned yet.
@@ -333,15 +355,14 @@ const SiteDetail = () => {
         </DialogContent>
       </Dialog>
 
-      {!isFinished && (
-        <SiteAllocationHistory
-          siteId={site.id}
-          ledger={ledger}
-          machines={machines}
-          allowEdit={allowMachineryEdit}
-          onEditEntry={openManageMovement}
-        />
-      )}
+      <SiteAllocationHistory
+        siteId={site.id}
+        ledger={ledger}
+        machines={machines}
+        allowEdit={allowMachineryEdit && !isFinished}
+        onEditEntry={openManageMovement}
+        includeClosureEvents={isFinished}
+      />
 
       {allowMachineryEdit && !isFinished && (
         <ManageMachineryDialog

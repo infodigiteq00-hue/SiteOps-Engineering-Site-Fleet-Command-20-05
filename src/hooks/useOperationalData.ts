@@ -1249,15 +1249,26 @@ export function useCompleteSiteClosureMutation() {
       }
 
       const closureSummary = buildClosureSummaryFromDispositions(input.dispositions, actorName);
+      const siteCompletedPatch = {
+        status: "completed" as const,
+        updated_at: new Date().toISOString(),
+      };
       const { error: siteErr } = await supabase
         .from("sites")
-        .update({
-          status: "completed",
-          closure_summary: closureSummary,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ ...siteCompletedPatch, closure_summary: closureSummary })
         .eq("id", input.siteId);
-      if (siteErr) throw siteErr;
+      if (siteErr) {
+        const message = String(siteErr.message ?? "");
+        if (message.includes("closure_summary")) {
+          const { error: retryErr } = await supabase
+            .from("sites")
+            .update(siteCompletedPatch)
+            .eq("id", input.siteId);
+          if (retryErr) throw retryErr;
+        } else {
+          throw siteErr;
+        }
+      }
 
       const totalUnits = closureSummary.totalUnits;
       try {
