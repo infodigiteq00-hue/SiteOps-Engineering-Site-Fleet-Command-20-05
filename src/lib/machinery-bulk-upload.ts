@@ -1,6 +1,7 @@
 import type { Machine, MachineryStatus, Site } from "@/domain/types";
 import { normalizeMachineryUnitType, type MachineryUnitType } from "@/lib/machinery-unit-types";
 import { seedCategoryCodegen, takeMachineryUnitsFromCursor, type MachineryCodegenCursor } from "@/lib/machinery-unit-codegen";
+import { machineryRecordsForQuantity } from "@/lib/machinery-unit-types";
 
 export type BulkParsedRow = {
   category: string;
@@ -23,10 +24,7 @@ export type BulkSiteConfirmItem = {
   locationMismatch?: boolean;
 };
 
-export type BulkSiteMatchResult =
-  | { kind: "exact"; site: Site }
-  | { kind: "name"; site: Site; locationMismatch: boolean }
-  | { kind: "none" };
+export type BulkSiteMatchResult = { kind: "exact"; site: Site } | { kind: "none" };
 
 export type BulkPreviewGroup = {
   category: string;
@@ -115,21 +113,9 @@ export function siteDeploymentExists(
   );
 }
 
-export function siteNameTakenForCompany(
-  name: string,
-  companyId: string,
-  sites: Site[],
-  normalizedPending?: ReadonlySet<string>,
-): boolean {
-  const nk = normBulkCompareKey(name);
-  if (!name.trim()) return true;
-  if (normalizedPending?.has(nk)) return true;
-  return sites.some((site) => site.companyId === companyId && normBulkCompareKey(site.name) === nk);
-}
-
 /**
  * Resolve CSV project/location to an existing site (company-scoped).
- * Uses exact name+location first, then a single name match — never loose substring matching.
+ * Only matches when both name and location match — same name at a different location is a separate site.
  */
 export function findBulkSiteForMachineryImport(
   sites: Site[],
@@ -146,18 +132,19 @@ export function findBulkSiteForMachineryImport(
   );
   if (exact) return { kind: "exact", site: exact };
 
-  const byName = scoped.filter((site) => normBulkCompareKey(site.name) === nameKey);
-  if (byName.length === 1) {
-    const site = byName[0];
-    return { kind: "name", site, locationMismatch: normBulkCompareKey(site.location) !== locKey };
-  }
-  if (byName.length > 1) {
-    const locMatch = byName.find((site) => normBulkCompareKey(site.location) === locKey);
-    if (locMatch) return { kind: "exact", site: locMatch };
-    return { kind: "name", site: byName[0], locationMismatch: true };
-  }
-
   return { kind: "none" };
+}
+
+/** Existing site when bulk create would duplicate the same name + location deployment. */
+export function existingSiteForBulkWizardConflict(
+  sites: Site[],
+  name: string,
+  location: string,
+  companyId: string,
+): { site: Site; locationMismatch: boolean } | null {
+  const match = findBulkSiteForMachineryImport(sites, name.trim(), location.trim(), companyId);
+  if (match.kind === "exact") return { site: match.site, locationMismatch: false };
+  return null;
 }
 
 function collectDeploymentKeys(rows: BulkParsedRow[], includeAllDeployments: boolean): string[] {
@@ -199,13 +186,13 @@ export function buildBulkSiteResolutionsAndQueue(
       resolutions[key] = { siteId: match.site.id, displayName: match.site.name };
       continue;
     }
-    if (match.kind === "exact" || match.kind === "name") {
+    if (match.kind === "exact") {
       queue.push({
         key,
         csvProjectName: projectName,
         csvLocation: location,
         existingSite: match.site,
-        locationMismatch: match.kind === "name" ? match.locationMismatch : false,
+        locationMismatch: false,
       });
       continue;
     }
@@ -286,9 +273,9 @@ export function countExistingBulkMachinery(
   ).length;
 }
 
-/** CSV qty is the number of new units to insert (additive; never replaces existing rows). */
-export function bulkUnitsToCreate(csvQty: number): number {
-  return csvQty <= 0 ? 0 : csvQty;
+/** CSV qty is the number of new rows to insert (20 metre → 1 row; 20 nos → 20 rows). */
+export function bulkUnitsToCreate(csvQty: number, unitType: MachineryUnitType | string): number {
+  return machineryRecordsForQuantity(csvQty, unitType);
 }
 
 export function bulkValidationUniqueCodes(rows: BulkParsedRow[], machines: Machine[]): string | null {
@@ -403,7 +390,7 @@ export function parseBulkStructural(
     });
 
     aggregated.forEach((spec) => {
-      const unitsToAdd = bulkUnitsToCreate(spec.qty);
+      const unitsToAdd = bulkUnitsToCreate(spec.qty, spec.unitType);
       if (unitsToAdd === 0) return;
 
       const categoryKey = spec.category.toLowerCase();

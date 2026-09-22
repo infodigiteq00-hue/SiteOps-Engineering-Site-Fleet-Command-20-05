@@ -200,6 +200,14 @@ const PlatformAdmin = () => {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    const timer = window.setInterval(() => {
+      void load();
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
   const inviteByCompanyId = useMemo(() => {
     const m = new Map<string, FirmInviteRow>();
     firmInvites.forEach((inv) => {

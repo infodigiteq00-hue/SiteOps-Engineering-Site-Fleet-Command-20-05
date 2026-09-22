@@ -57,6 +57,7 @@ export function mapMachinery(row: MachineryRow): Machine {
     name: String(row.name),
     category: String(row.category) as MachineryCategory,
     unitType: normalizeMachineryUnitType(row.unit_type),
+    stockQuantity: Math.max(1, Number(row.stock_quantity ?? 1) || 1),
     status: row.status as MachineryStatus,
     assignedSiteId: row.assigned_site_id == null ? null : String(row.assigned_site_id),
     lostFromSiteId: row.lost_from_site_id == null ? null : String(row.lost_from_site_id),
@@ -65,6 +66,8 @@ export function mapMachinery(row: MachineryRow): Machine {
     assignedTo: row.assigned_to == null ? undefined : String(row.assigned_to),
     approvedBy: row.approved_by == null ? undefined : String(row.approved_by),
     closureNotes: row.closure_notes == null ? undefined : String(row.closure_notes),
+    invoiceNumber: row.invoice_number == null || String(row.invoice_number).trim() === "" ? undefined : String(row.invoice_number),
+    purchaseDate: row.purchase_date == null || String(row.purchase_date).trim() === "" ? undefined : String(row.purchase_date).slice(0, 10),
   };
 }
 

@@ -66,3 +66,28 @@ export function formatQtyWithUnit(qty: number | string, unitType?: MachineryUnit
   if (!Number.isFinite(n) || n <= 0) return "";
   return `${n} ${unit}`;
 }
+
+/** Metre, kg, litre, and other non-piece units are one machinery row per line (qty lives on movements). */
+export function usesContinuousQuantity(unitType: MachineryUnitType | string): boolean {
+  const unit = normalizeMachineryUnitType(unitType);
+  return unit !== "nos" && unit !== "set" && unit !== "pair" && unit !== "box";
+}
+
+/** How many DB machinery rows to create for a given qty + unit (20 metre → 1 row, 20 nos → 20 rows). */
+export function machineryRecordsForQuantity(quantity: number, unitType: MachineryUnitType | string): number {
+  const qty = Math.max(0, quantity);
+  if (qty === 0) return 0;
+  return usesContinuousQuantity(unitType) ? 1 : qty;
+}
+
+export function movementMachineIdsMatchQuantity(
+  machineIds: string[],
+  quantity: number,
+  unitType?: MachineryUnitType | string | null,
+): boolean {
+  if (quantity < 1 || machineIds.length === 0) return false;
+  if (unitType && usesContinuousQuantity(unitType)) {
+    return machineIds.length === 1;
+  }
+  return machineIds.length === quantity;
+}

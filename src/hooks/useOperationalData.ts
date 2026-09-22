@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/lib/supabaseClient";
 import { mapSite, mapMachinery, mapRequest, mapLedger, type CompanyRow } from "@/lib/db-mapper";
-import type { Site, SiteStatus, MachineryStatus, MachineryCategory, RequestSourceType } from "@/domain/types";
+import type { Machine, Site, SiteStatus, MachineryStatus, MachineryCategory, RequestSourceType } from "@/domain/types";
 import { buildClosureSummaryFromDispositions } from "@/lib/site-closure-summary";
 import type { MachineryMovementDirection } from "@/lib/site-allocation-history";
 import {
@@ -16,6 +16,9 @@ export type { MachineryMovementDirection } from "@/lib/site-allocation-history";
 import { categoryCodePrefix, toCodeChunk } from "@/domain/types";
 import { DEFAULT_MACHINERY_UNIT_TYPE, normalizeMachineryUnitType } from "@/lib/machinery-unit-types";
 import type { MachineryUnitType } from "@/lib/machinery-unit-types";
+import { resolveMachineryUnitCodes } from "@/lib/machinery-unit-codegen";
+import { stockSumForMachineIds } from "@/lib/machinery-movement-selection";
+import { applyMachineryMovementStock, revertMachineryMovementStock } from "@/lib/machinery-movement-stock";
 import { useAuth } from "@/contexts/AuthContext";
 import { fetchAllSupabasePages } from "@/lib/supabase-fetch-all";
 import { peekCurrentUser, ROLE_LABELS } from "@/lib/session";
@@ -41,12 +44,51 @@ function queriesEnabled(enabled: boolean) {
   return Boolean(enabled);
 }
 
-/** Keep operational lists fresh for dashboard counts and tables. */
+/** Reuse cached lists; only refetch a slice when it is stale or that slice changes. */
 export const OPERATIONAL_LIVE_QUERY = {
-  staleTime: 0,
-  refetchOnWindowFocus: true,
-  refetchInterval: 30_000,
+  staleTime: 60_000,
+  gcTime: 30 * 60_000,
+  refetchOnMount: true,
+  refetchOnWindowFocus: false,
+  refetchOnReconnect: true,
 } as const;
+
+export type OperationalSlice =
+  | "sites"
+  | "machinery"
+  | "requests"
+  | "ledger"
+  | "companies"
+  | "machinerySourceStatuses";
+
+const SLICE_QUERY_KEY: Record<OperationalSlice, readonly unknown[]> = {
+  sites: operationalKeys.sites(),
+  machinery: operationalKeys.machinery(),
+  requests: operationalKeys.requests(),
+  ledger: operationalKeys.ledger(),
+  companies: operationalKeys.companies(),
+  machinerySourceStatuses: [...operationalKeys.all, "machinery-source-statuses"],
+};
+
+/** Map a live table change to the query slices that actually need a refresh. */
+export function operationalSlicesForTable(table: string): OperationalSlice[] {
+  switch (table) {
+    case "sites":
+      return ["sites"];
+    case "machinery":
+      return ["machinery"];
+    case "machinery_requests":
+      return ["requests"];
+    case "audit_ledger":
+      return ["ledger"];
+    case "companies":
+      return ["companies"];
+    case "company_machinery_source_statuses":
+      return ["machinerySourceStatuses"];
+    default:
+      return [];
+  }
+}
 
 async function fetchSites(): Promise<Site[]> {
   const rows = await fetchAllSupabasePages((from, to) =>
@@ -115,7 +157,7 @@ export function useLedgerQuery() {
 export function useCompaniesQuery() {
   const { isSupabaseEnabled, session } = useAuth();
   const ok = queriesEnabled(isSupabaseEnabled && Boolean(session));
-  return useQuery({ queryKey: operationalKeys.companies(), queryFn: fetchCompanies, enabled: ok });
+  return useQuery({ queryKey: operationalKeys.companies(), queryFn: fetchCompanies, enabled: ok, ...OPERATIONAL_LIVE_QUERY });
 }
 
 async function fetchMachinerySourceStatuses(companyId: string): Promise<CompanyMachinerySourceStatus[]> {
@@ -174,7 +216,7 @@ export function useOperationalBootstrap() {
   const enabled = isSupabaseEnabled && Boolean(session);
   const queries = [sites, machinery, requests, ledger] as const;
 
-  const isBootstrapping = enabled && queries.some((q) => q.isPending && !q.isFetched);
+  const isBootstrapping = enabled && queries.some((q) => q.isPending && q.data === undefined);
   const failed = queries.find((q) => q.isError);
   const hasError = enabled && Boolean(failed);
   const errorMessage =
@@ -187,8 +229,60 @@ export function useOperationalBootstrap() {
   return { isBootstrapping, hasError, errorMessage };
 }
 
-function invalidateOperational(qc: ReturnType<typeof useQueryClient>) {
-  void qc.invalidateQueries({ queryKey: operationalKeys.all });
+/** Refetch only the slices a write or live event actually changed. */
+export function refreshOperationalSlices(
+  qc: ReturnType<typeof useQueryClient>,
+  ...slices: OperationalSlice[]
+) {
+  const unique = [...new Set(slices)];
+  for (const slice of unique) {
+    void qc.invalidateQueries({ queryKey: SLICE_QUERY_KEY[slice] });
+  }
+}
+
+/** Full operational refetch — keep for rare cases; prefer refreshOperationalSlices. */
+export function refreshOperationalData(qc: ReturnType<typeof useQueryClient>) {
+  refreshOperationalSlices(qc, "sites", "machinery", "requests", "ledger", "companies");
+}
+
+function invalidateOperational(qc: ReturnType<typeof useQueryClient>, ...slices: OperationalSlice[]) {
+  if (slices.length === 0) {
+    refreshOperationalData(qc);
+    return;
+  }
+  refreshOperationalSlices(qc, ...slices);
+}
+
+function removeMachinesFromCache(qc: ReturnType<typeof useQueryClient>, machineIds: string[]) {
+  const remove = new Set(machineIds);
+  qc.setQueryData<Machine[]>(operationalKeys.machinery(), (current) =>
+    Array.isArray(current) ? current.filter((machine) => !remove.has(machine.id)) : current,
+  );
+}
+
+function patchMachinesInCache(
+  qc: ReturnType<typeof useQueryClient>,
+  machineIds: string[],
+  updates: MachineUpdate,
+) {
+  const ids = new Set(machineIds);
+  qc.setQueryData<Machine[]>(operationalKeys.machinery(), (current) =>
+    Array.isArray(current)
+      ? current.map((machine) => {
+          if (!ids.has(machine.id)) return machine;
+          return {
+            ...machine,
+            ...(updates.status !== undefined ? { status: updates.status } : {}),
+            ...(updates.assignedSiteId !== undefined ? { assignedSiteId: updates.assignedSiteId } : {}),
+            ...(updates.lostFromSiteId !== undefined ? { lostFromSiteId: updates.lostFromSiteId } : {}),
+            ...(updates.projectName !== undefined ? { projectName: updates.projectName } : {}),
+            ...(updates.projectLocation !== undefined ? { projectLocation: updates.projectLocation } : {}),
+            ...(updates.assignedTo !== undefined ? { assignedTo: updates.assignedTo } : {}),
+            ...(updates.approvedBy !== undefined ? { approvedBy: updates.approvedBy } : {}),
+          };
+        })
+      : current,
+  );
 }
 
 export type AppendAuditLedgerInput = {
@@ -295,7 +389,7 @@ export function useCreateSiteMutation() {
 
       return siteId;
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "sites", "machinery", "ledger"),
   });
 }
 
@@ -342,7 +436,7 @@ export function useUpdateSiteMutation() {
         console.warn("[ledger] append skipped after site_updated", err);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "sites", "ledger"),
   });
 }
 
@@ -369,7 +463,7 @@ export function useDeleteSiteMutation() {
         console.warn("[ledger] append skipped after site_deleted", err);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "sites", "machinery", "ledger"),
   });
 }
 
@@ -429,7 +523,7 @@ export function useCreateRequestMutation() {
         console.warn("[ledger] append skipped after request_created", err);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "requests", "ledger"),
   });
 }
 
@@ -579,7 +673,7 @@ export function useApproveRequestMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, decision }: { id: string; decision: RequestDecision }) => approveRequestRemote(id, decision),
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "requests", "machinery", "ledger"),
   });
 }
 
@@ -587,7 +681,7 @@ export function useRejectRequestMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, decision }: { id: string; decision: RequestDecision }) => rejectRequestRemote(id, decision),
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "requests", "ledger"),
   });
 }
 
@@ -601,94 +695,113 @@ export type MachineUpdate = Partial<{
   approvedBy: string | undefined;
 }>;
 
+async function applyMachineUpdate(machineId: string, updates: MachineUpdate) {
+  const { data: row, error: gErr } = await supabase.from("machinery").select("*").eq("id", machineId).maybeSingle();
+  if (gErr) throw gErr;
+  if (!row) throw new Error("Machinery not found");
+  const before = mapMachinery(row);
+
+  const patch: Record<string, unknown> = {};
+  if (updates.status !== undefined) patch.status = updates.status;
+  if (updates.assignedSiteId !== undefined) patch.assigned_site_id = updates.assignedSiteId;
+  if (updates.lostFromSiteId !== undefined) patch.lost_from_site_id = updates.lostFromSiteId;
+
+  if (updates.status === "lost_damaged") {
+    if (updates.assignedSiteId === undefined) patch.assigned_site_id = null;
+    patch.lost_from_site_id = before.assignedSiteId ?? updates.lostFromSiteId ?? null;
+  } else if (updates.status !== undefined) {
+    patch.lost_from_site_id = null;
+  }
+  if (updates.projectName !== undefined) patch.project_name = updates.projectName ?? null;
+  if (updates.projectLocation !== undefined) patch.project_location = updates.projectLocation ?? null;
+  if (updates.assignedTo !== undefined) patch.assigned_to = updates.assignedTo ?? null;
+  if (updates.approvedBy !== undefined) patch.approved_by = updates.approvedBy ?? null;
+
+  const { error } = await supabase.from("machinery").update(patch).eq("id", machineId);
+  if (error) throw error;
+
+  const idsToLabel = [...new Set([before.assignedSiteId, updates.assignedSiteId].filter(Boolean))] as string[];
+  let siteNamesById: Record<string, string> = {};
+  if (idsToLabel.length > 0) {
+    const { data: siteRows } = await supabase.from("sites").select("id,name").in("id", idsToLabel);
+    siteNamesById = Object.fromEntries((siteRows ?? []).map((r) => [String(r.id), String(r.name)]));
+  }
+  const describeSite = (id: string | null) =>
+    id == null ? "company pool" : siteNamesById[id] ?? id;
+
+  const changes: string[] = [];
+  let eventKind = "machinery_field_updated";
+
+  if (updates.status !== undefined && updates.status !== before.status) {
+    changes.push(`Status ${before.status} → ${updates.status}`);
+  }
+  if (updates.assignedSiteId !== undefined && updates.assignedSiteId !== before.assignedSiteId) {
+    changes.push(`Transferred ${describeSite(before.assignedSiteId)} → ${describeSite(updates.assignedSiteId)}`);
+  }
+  if (updates.projectName !== undefined && updates.projectName?.trim() !== (before.projectName ?? "").trim()) {
+    changes.push("Project title updated");
+  }
+  if (updates.projectLocation !== undefined && updates.projectLocation?.trim() !== (before.projectLocation ?? "").trim()) {
+    changes.push("Site / location notes updated");
+  }
+  if (updates.assignedTo !== undefined && updates.assignedTo?.trim() !== (before.assignedTo ?? "").trim()) {
+    changes.push("Assigned personnel updated");
+  }
+  if (updates.approvedBy !== undefined && updates.approvedBy?.trim() !== (before.approvedBy ?? "").trim()) {
+    changes.push("Approval contact updated");
+  }
+
+  const siteChanged =
+    updates.assignedSiteId !== undefined && updates.assignedSiteId !== before.assignedSiteId;
+  if (siteChanged) eventKind = "machinery_relocated";
+  else if (updates.status !== undefined && updates.status !== before.status) eventKind = "machinery_status_changed";
+
+  if (changes.length > 0) {
+    const actor = peekCurrentUser();
+    const auditSite =
+      updates.assignedSiteId !== undefined ? updates.assignedSiteId : before.assignedSiteId;
+    try {
+      await appendAuditLedgerEntry({
+        companyId: before.companyId,
+        eventKind,
+        summary: `[${before.code}] ${before.name} — ${changes.join("; ")}`,
+        siteId: auditSite,
+        machineIds: [machineId],
+        requester: actor?.name ?? "System",
+        approvedBy: actor?.name ?? "System",
+        approverRole: actor ? ROLE_LABELS[actor.role] : null,
+        totalUnits: 1,
+      });
+    } catch (err) {
+      console.warn("[ledger] append skipped after machinery update", err);
+    }
+  }
+}
+
 export function useUpdateMachineMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async ({ machineId, updates }: { machineId: string; updates: MachineUpdate }) => {
-      const { data: row, error: gErr } = await supabase.from("machinery").select("*").eq("id", machineId).maybeSingle();
-      if (gErr) throw gErr;
-      if (!row) throw new Error("Machinery not found");
-      const before = mapMachinery(row);
-
-      const patch: Record<string, unknown> = {};
-      if (updates.status !== undefined) patch.status = updates.status;
-      if (updates.assignedSiteId !== undefined) patch.assigned_site_id = updates.assignedSiteId;
-      if (updates.lostFromSiteId !== undefined) patch.lost_from_site_id = updates.lostFromSiteId;
-
-      if (updates.status === "lost_damaged") {
-        if (updates.assignedSiteId === undefined) patch.assigned_site_id = null;
-        if (updates.lostFromSiteId === undefined && before.assignedSiteId) {
-          patch.lost_from_site_id = before.assignedSiteId;
-        }
-      } else if (updates.status !== undefined) {
-        patch.lost_from_site_id = null;
-      }
-      if (updates.projectName !== undefined) patch.project_name = updates.projectName ?? null;
-      if (updates.projectLocation !== undefined) patch.project_location = updates.projectLocation ?? null;
-      if (updates.assignedTo !== undefined) patch.assigned_to = updates.assignedTo ?? null;
-      if (updates.approvedBy !== undefined) patch.approved_by = updates.approvedBy ?? null;
-
-      const { error } = await supabase.from("machinery").update(patch).eq("id", machineId);
-      if (error) throw error;
-
-      const idsToLabel = [...new Set([before.assignedSiteId, updates.assignedSiteId].filter(Boolean))] as string[];
-      let siteNamesById: Record<string, string> = {};
-      if (idsToLabel.length > 0) {
-        const { data: siteRows } = await supabase.from("sites").select("id,name").in("id", idsToLabel);
-        siteNamesById = Object.fromEntries((siteRows ?? []).map((r) => [String(r.id), String(r.name)]));
-      }
-      const describeSite = (id: string | null) =>
-        id == null ? "company pool" : siteNamesById[id] ?? id;
-
-      const changes: string[] = [];
-      let eventKind = "machinery_field_updated";
-
-      if (updates.status !== undefined && updates.status !== before.status) {
-        changes.push(`Status ${before.status} → ${updates.status}`);
-      }
-      if (updates.assignedSiteId !== undefined && updates.assignedSiteId !== before.assignedSiteId) {
-        changes.push(`Transferred ${describeSite(before.assignedSiteId)} → ${describeSite(updates.assignedSiteId)}`);
-      }
-      if (updates.projectName !== undefined && updates.projectName?.trim() !== (before.projectName ?? "").trim()) {
-        changes.push("Project title updated");
-      }
-      if (updates.projectLocation !== undefined && updates.projectLocation?.trim() !== (before.projectLocation ?? "").trim()) {
-        changes.push("Site / location notes updated");
-      }
-      if (updates.assignedTo !== undefined && updates.assignedTo?.trim() !== (before.assignedTo ?? "").trim()) {
-        changes.push("Assigned personnel updated");
-      }
-      if (updates.approvedBy !== undefined && updates.approvedBy?.trim() !== (before.approvedBy ?? "").trim()) {
-        changes.push("Approval contact updated");
-      }
-
-      const siteChanged =
-        updates.assignedSiteId !== undefined && updates.assignedSiteId !== before.assignedSiteId;
-      if (siteChanged) eventKind = "machinery_relocated";
-      else if (updates.status !== undefined && updates.status !== before.status) eventKind = "machinery_status_changed";
-
-      if (changes.length > 0) {
-        const actor = peekCurrentUser();
-        const auditSite =
-          updates.assignedSiteId !== undefined ? updates.assignedSiteId : before.assignedSiteId;
-        try {
-          await appendAuditLedgerEntry({
-            companyId: before.companyId,
-            eventKind,
-            summary: `[${before.code}] ${before.name} — ${changes.join("; ")}`,
-            siteId: auditSite,
-            machineIds: [machineId],
-            requester: actor?.name ?? "System",
-            approvedBy: actor?.name ?? "System",
-            approverRole: actor ? ROLE_LABELS[actor.role] : null,
-            totalUnits: 1,
-          });
-        } catch (err) {
-          console.warn("[ledger] append skipped after machinery update", err);
-        }
-      }
+      await applyMachineUpdate(machineId, updates);
+      patchMachinesInCache(qc, [machineId], updates);
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
+  });
+}
+
+export function useUpdateMachinesMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ machineIds, updates }: { machineIds: string[]; updates: MachineUpdate }) => {
+      const uniqueIds = [...new Set(machineIds.filter(Boolean))];
+      if (uniqueIds.length === 0) throw new Error("No machinery selected");
+      for (const machineId of uniqueIds) {
+        await applyMachineUpdate(machineId, updates);
+      }
+      patchMachinesInCache(qc, uniqueIds, updates);
+      return uniqueIds.length;
+    },
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
   });
 }
 
@@ -702,27 +815,62 @@ export function useDeleteMachineMutation() {
 
       const { error } = await supabase.from("machinery").delete().eq("id", machineId);
       if (error) throw error;
+      removeMachinesFromCache(qc, [machineId]);
 
       if (before) {
         const actor = peekCurrentUser();
-        try {
-          await appendAuditLedgerEntry({
+        void appendAuditLedgerEntry({
+          companyId: before.companyId,
+          eventKind: "machinery_deleted",
+          summary: `Removed machinery ${before.code} (${before.name}).`,
+          siteId: before.assignedSiteId,
+          machineIds: [machineId],
+          requester: actor?.name ?? "System",
+          approvedBy: actor?.name ?? "System",
+          approverRole: actor ? ROLE_LABELS[actor.role] : null,
+          totalUnits: 1,
+        }).catch((err) => console.warn("[ledger] append skipped after machinery_deleted", err));
+      }
+    },
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
+  });
+}
+
+export function useDeleteMachinesMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (machineIds: string[]) => {
+      const uniqueIds = [...new Set(machineIds.filter(Boolean))];
+      if (uniqueIds.length === 0) throw new Error("No machinery selected");
+
+      const { data: rows, error: gErr } = await supabase.from("machinery").select("*").in("id", uniqueIds);
+      if (gErr) throw gErr;
+      const beforeRows = (rows ?? []).map(mapMachinery);
+
+      const { error } = await supabase.from("machinery").delete().in("id", uniqueIds);
+      if (error) throw error;
+      removeMachinesFromCache(qc, uniqueIds);
+
+      const actor = peekCurrentUser();
+      void Promise.all(
+        beforeRows.map((before) =>
+          appendAuditLedgerEntry({
             companyId: before.companyId,
             eventKind: "machinery_deleted",
             summary: `Removed machinery ${before.code} (${before.name}).`,
             siteId: before.assignedSiteId,
-            machineIds: [machineId],
+            machineIds: [before.id],
             requester: actor?.name ?? "System",
             approvedBy: actor?.name ?? "System",
             approverRole: actor ? ROLE_LABELS[actor.role] : null,
             totalUnits: 1,
-          });
-        } catch (err) {
-          console.warn("[ledger] append skipped after machinery_deleted", err);
-        }
-      }
+          }).catch((err) => console.warn("[ledger] append skipped after machinery_deleted", err)),
+        ),
+      );
+
+      return beforeRows.length;
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
   });
 }
 
@@ -777,7 +925,7 @@ export function useRenameCategoryMutation() {
 
       if (totalUpdated === 0) throw new Error("No machinery updated");
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
   });
 }
 
@@ -822,13 +970,14 @@ export function useDeleteCategoryMutation() {
 
       if (totalDeleted === 0) throw new Error("No machinery deleted");
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
   });
 }
 
 export type AddMachineryUnit = {
   code: string;
   name: string;
+  stockQuantity?: number;
   projectName?: string;
   projectLocation?: string;
   assignedTo?: string;
@@ -850,22 +999,49 @@ export function useAddMachineryMutation() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (payload: AddMachineryPayload) => {
-      const normalizedUnits = payload.units
+      let siteCompany = payload.companyId;
+      if (payload.assignedSiteId) {
+        const { data: st } = await supabase.from("sites").select("company_id").eq("id", payload.assignedSiteId).single();
+        siteCompany = st?.company_id ?? payload.companyId;
+      }
+
+      const namedUnits = payload.units
         .map((unit) => ({
           code: unit.code.trim(),
           name: unit.name.trim(),
+          stock_quantity: Math.max(1, unit.stockQuantity ?? 1),
           project_name: unit.projectName?.trim() ?? null,
           project_location: unit.projectLocation?.trim() ?? null,
           assigned_to: unit.assignedTo?.trim() ?? null,
           approved_by: unit.approvedBy?.trim() ?? null,
         }))
-        .filter((unit) => unit.code && unit.name);
-      if (!payload.category.trim() || normalizedUnits.length === 0) throw new Error("Invalid machinery payload");
+        .filter((unit) => unit.name);
+      if (!payload.category.trim() || namedUnits.length === 0) throw new Error("Invalid machinery payload");
 
-      let siteCompany = payload.companyId;
-      if (payload.assignedSiteId) {
-        const { data: st } = await supabase.from("sites").select("company_id").eq("id", payload.assignedSiteId).single();
-        siteCompany = st?.company_id ?? payload.companyId;
+      let normalizedUnits = namedUnits;
+      if (namedUnits.some((unit) => !unit.code)) {
+        const machRows = await fetchAllSupabasePages((from, to) =>
+          supabase
+            .from("machinery")
+            .select("*")
+            .eq("company_id", siteCompany)
+            .order("code")
+            .range(from, to),
+        );
+        const companyMachines = machRows.map((row) => mapMachinery(row));
+        const resolved = resolveMachineryUnitCodes(
+          payload.category.trim(),
+          companyMachines,
+          namedUnits.map((unit) => ({ code: unit.code, name: unit.name })),
+        );
+        normalizedUnits = namedUnits.map((unit, index) => ({
+          ...unit,
+          code: resolved[index]?.code ?? unit.code,
+        }));
+      }
+
+      if (normalizedUnits.some((unit) => !unit.code)) {
+        throw new Error("Could not assign machinery codes");
       }
 
       const unitType = normalizeMachineryUnitType(payload.unitType ?? DEFAULT_MACHINERY_UNIT_TYPE);
@@ -878,6 +1054,7 @@ export function useAddMachineryMutation() {
           name: unit.name,
           category: payload.category.trim(),
           unit_type: unitType,
+          stock_quantity: unit.stock_quantity,
           status: payload.status,
           assigned_site_id: payload.status === "assigned" ? payload.assignedSiteId : null,
           project_name: unit.project_name,
@@ -914,7 +1091,7 @@ export function useAddMachineryMutation() {
 
       return { machineIds: fixedRows.map((r) => r.id as string) };
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger"),
   });
 }
 
@@ -931,6 +1108,7 @@ export type RecordMachineryMovementInput = {
   machineIds: string[];
   machineryLabel: string;
   quantity: number;
+  unitType?: MachineryUnitType;
 };
 
 function revertSourceStatusForMovement(
@@ -952,12 +1130,15 @@ function buildMovementSummary(input: {
   sourceStatus: MachineryStatus;
   customSourceStatus?: string;
   gatePassNumber?: string;
+  unitType?: MachineryUnitType;
 }): string {
   const gatePass = input.gatePassNumber?.trim();
   const gatePassNote = gatePass ? ` · Gate pass ${gatePass}` : "";
   const poolLabel = formatMovementPoolLabel(input.sourceStatus, input.customSourceStatus);
   const movementVerb = input.direction === "in" ? "moved OUT from" : "received IN at";
-  return `${input.quantity} Qty ${input.machineryLabel} ${movementVerb} ${input.siteName} by ${input.actorName} (${poolLabel} pool)${gatePassNote}.`;
+  const unit = normalizeMachineryUnitType(input.unitType ?? DEFAULT_MACHINERY_UNIT_TYPE);
+  const qtyLabel = unit === DEFAULT_MACHINERY_UNIT_TYPE ? `${input.quantity} Qty` : `${input.quantity} ${unit} Qty`;
+  return `${qtyLabel} ${input.machineryLabel} ${movementVerb} ${input.siteName} by ${input.actorName} (${poolLabel} pool)${gatePassNote}.`;
 }
 
 function movementUpdatesForDirection(
@@ -991,17 +1172,29 @@ export function useRecordMachineryMovementMutation() {
         throw new Error("Enter machinery name");
       }
 
+      let ledgerMachineIds = input.machineIds;
+
       if (!isCustomPool) {
         if (input.machineIds.length === 0) {
           throw new Error("Select machinery and quantity");
         }
-        if (input.machineIds.length !== input.quantity) {
-          throw new Error("Quantity does not match selected units");
+
+        const { data: rows, error: fetchErr } = await supabase.from("machinery").select("*").in("id", input.machineIds);
+        if (fetchErr) throw fetchErr;
+        const machinesById = new Map(rows.map((row) => [String(row.id), mapMachinery(row)]));
+        const coveredStock = stockSumForMachineIds(input.machineIds, machinesById);
+        if (coveredStock < input.quantity) {
+          throw new Error("Quantity exceeds available stock in the selected pool");
         }
 
-        const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
-        const { error } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
-        if (error) throw error;
+        ledgerMachineIds = await applyMachineryMovementStock(
+          input.machineIds,
+          input.quantity,
+          input.direction,
+          input.sourceStatus,
+          input.siteId,
+          machinesById,
+        );
       }
 
       const actor = peekCurrentUser();
@@ -1015,6 +1208,7 @@ export function useRecordMachineryMovementMutation() {
         sourceStatus: input.sourceStatus,
         customSourceStatus: customPool,
         gatePassNumber: input.gatePassNumber,
+        unitType: input.unitType,
       });
 
       try {
@@ -1023,7 +1217,7 @@ export function useRecordMachineryMovementMutation() {
           eventKind: movementEventKindFromDirection(input.direction),
           summary,
           siteId: input.siteId,
-          machineIds: input.machineIds,
+          machineIds: ledgerMachineIds,
           requester: actorName,
           approvedBy: actorName,
           approverRole: actor ? ROLE_LABELS[actor.role] : null,
@@ -1040,7 +1234,7 @@ export function useRecordMachineryMovementMutation() {
         await ensureCompanyMachinerySourceStatus(input.companyId, customPool);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger", "machinerySourceStatuses"),
   });
 }
 
@@ -1069,31 +1263,46 @@ export function useUpdateMachineryMovementMutation() {
         throw new Error("Enter machinery name");
       }
 
+      let ledgerMachineIds = input.machineIds;
+
       if (!isCustomPool) {
         if (input.machineIds.length === 0) {
           throw new Error("Select machinery and quantity");
         }
-        if (input.machineIds.length !== input.quantity) {
-          throw new Error("Quantity does not match selected units");
-        }
       }
 
-      const inverseDirection: MachineryMovementDirection = input.original.direction === "in" ? "out" : "in";
-      const revertSource = revertSourceStatusForMovement(input.original.direction, input.original.sourceStatus);
-      const revertPatch = movementUpdatesForDirection(inverseDirection, revertSource, input.siteId);
+      const allIds = Array.from(new Set([...input.original.machineIds, ...input.machineIds]));
+      const { data: rows, error: fetchErr } =
+        allIds.length > 0
+          ? await supabase.from("machinery").select("*").in("id", allIds)
+          : { data: [], error: null };
+      if (fetchErr) throw fetchErr;
+      const machinesById = new Map(rows.map((row) => [String(row.id), mapMachinery(row)]));
 
       if (!wasCustomPool && input.original.machineIds.length > 0) {
-        const { error: revertErr } = await supabase
-          .from("machinery")
-          .update(revertPatch)
-          .in("id", input.original.machineIds);
-        if (revertErr) throw revertErr;
+        await revertMachineryMovementStock(
+          input.original.machineIds,
+          input.original.direction,
+          input.original.sourceStatus,
+          input.siteId,
+          machinesById,
+        );
       }
 
       if (!isCustomPool) {
-        const patch = movementUpdatesForDirection(input.direction, input.sourceStatus, input.siteId);
-        const { error: applyErr } = await supabase.from("machinery").update(patch).in("id", input.machineIds);
-        if (applyErr) throw applyErr;
+        const coveredStock = stockSumForMachineIds(input.machineIds, machinesById);
+        if (coveredStock < input.quantity) {
+          throw new Error("Quantity exceeds available stock in the selected pool");
+        }
+
+        ledgerMachineIds = await applyMachineryMovementStock(
+          input.machineIds,
+          input.quantity,
+          input.direction,
+          input.sourceStatus,
+          input.siteId,
+          machinesById,
+        );
       }
 
       const actor = peekCurrentUser();
@@ -1107,6 +1316,7 @@ export function useUpdateMachineryMovementMutation() {
         sourceStatus: input.sourceStatus,
         customSourceStatus: customPool,
         gatePassNumber: input.gatePassNumber,
+        unitType: input.unitType,
       });
 
       const { error: ledgerErr } = await supabase
@@ -1114,7 +1324,7 @@ export function useUpdateMachineryMovementMutation() {
         .update({
           event_kind: movementEventKindFromDirection(input.direction),
           summary,
-          machine_ids: isCustomPool ? [] : input.machineIds,
+          machine_ids: isCustomPool ? [] : ledgerMachineIds,
           from_date: input.movementDate,
           until_date: null,
           total_units: input.quantity,
@@ -1128,7 +1338,7 @@ export function useUpdateMachineryMovementMutation() {
         await ensureCompanyMachinerySourceStatus(input.companyId, customPool);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "machinery", "ledger", "machinerySourceStatuses"),
   });
 }
 
@@ -1249,15 +1459,26 @@ export function useCompleteSiteClosureMutation() {
       }
 
       const closureSummary = buildClosureSummaryFromDispositions(input.dispositions, actorName);
+      const siteCompletedPatch = {
+        status: "completed" as const,
+        updated_at: new Date().toISOString(),
+      };
       const { error: siteErr } = await supabase
         .from("sites")
-        .update({
-          status: "completed",
-          closure_summary: closureSummary,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ ...siteCompletedPatch, closure_summary: closureSummary })
         .eq("id", input.siteId);
-      if (siteErr) throw siteErr;
+      if (siteErr) {
+        const message = String(siteErr.message ?? "");
+        if (message.includes("closure_summary")) {
+          const { error: retryErr } = await supabase
+            .from("sites")
+            .update(siteCompletedPatch)
+            .eq("id", input.siteId);
+          if (retryErr) throw retryErr;
+        } else {
+          throw siteErr;
+        }
+      }
 
       const totalUnits = closureSummary.totalUnits;
       try {
@@ -1276,6 +1497,6 @@ export function useCompleteSiteClosureMutation() {
         console.warn("[ledger] append skipped after site_marked_completed", err);
       }
     },
-    onSuccess: () => invalidateOperational(qc),
+    onSuccess: () => invalidateOperational(qc, "sites", "machinery", "ledger"),
   });
 }

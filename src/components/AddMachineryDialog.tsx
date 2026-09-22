@@ -1,13 +1,11 @@
 import { ChangeEvent, DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Upload } from "lucide-react";
-import type { Machine, MachineryCategory, MachineryStatus, Site } from "@/domain/types";
-import { MACHINERY_CATEGORIES, categoryCodePrefix, toCodeChunk } from "@/domain/types";
+import type { MachineryStatus, Site } from "@/domain/types";
+import { MACHINERY_CATEGORIES } from "@/domain/types";
 import { ROLE_LABELS, useCurrentUser } from "@/lib/session";
 import { useScopedSites } from "@/hooks/useCompanyScope";
 import {
   appendAuditLedgerEntry,
-  operationalKeys,
   useAddMachineryMutation,
   useCreateSiteMutation,
   useMachineryQuery,
@@ -26,6 +24,8 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "@/hooks/use-toast";
+import { Checkbox } from "@/components/ui/checkbox";
+import { cn } from "@/lib/utils";
 import {
   CUSTOM_MACHINERY_UNIT_VALUE,
   DEFAULT_MACHINERY_UNIT_TYPE,
@@ -41,19 +41,36 @@ import {
   bulkGroupParsedRows,
   bulkGroupsToTemplatePreviewRows,
   bulkValidationUniqueCodes,
+  existingSiteForBulkWizardConflict,
   MACHINERY_BULK_SAMPLE_CSV,
   parseBulkStructural,
   siteAssignmentKey,
   siteDeploymentExists,
-  siteNameTakenForCompany,
   type BulkParsedRow,
   type BulkPreviewGroup,
   type BulkSiteConfirmItem,
   type BulkSiteResolution,
 } from "@/lib/machinery-bulk-upload";
+import { resolveMachineryUnitCodes, suggestMachineryUnits } from "@/lib/machinery-unit-codegen";
+import { formatQtyWithUnit } from "@/lib/machinery-unit-types";
+
+export type CreatedMachineryBatch = {
+  machineIds: string[];
+  category: string;
+  quantity: number;
+  unitType: MachineryUnitType;
+  label: string;
+};
 
 type Props = {
   buttonText?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  showTrigger?: boolean;
+  /** When set, new units are assigned to this site and the assignment fields are locked. */
+  lockAssignedSite?: Site | null;
+  nested?: boolean;
+  onCreated?: (batch: CreatedMachineryBatch) => void;
 };
 
 function resolveMachineryCompanyId(
@@ -90,8 +107,15 @@ function wizardUiSeed(item: BulkSiteConfirmItem): BulkWizardUi {
   return { mode: "case1-choice", nameDraft: item.csvProjectName.trim() };
 }
 
-export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
-  const queryClient = useQueryClient();
+export const AddMachineryDialog = ({
+  buttonText = "Add machinery",
+  open: controlledOpen,
+  onOpenChange,
+  showTrigger,
+  lockAssignedSite = null,
+  nested = false,
+  onCreated,
+}: Props) => {
   const user = useCurrentUser();
   const { data: machines = [] } = useMachineryQuery();
   const { data: sites = [], isPending: sitesPending } = useSitesQuery();
@@ -101,8 +125,13 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   const scopedSites = useScopedSites();
   const sitesForForm = user.role === "super_admin" ? sites : scopedSites;
 
+  const isControlled = controlledOpen !== undefined;
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = isControlled ? controlledOpen : internalOpen;
+  const setOpen = onOpenChange ?? setInternalOpen;
+  const shouldShowTrigger = showTrigger ?? !isControlled;
+
   const [poolCompanyId, setPoolCompanyId] = useState<string>("");
-  const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<"single" | "bulk">("single");
   const [unitEntries, setUnitEntries] = useState<Array<{ code: string; name: string }>>([]);
   const [bulkCsv, setBulkCsv] = useState("");
@@ -122,6 +151,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     status: "available" as MachineryStatus,
     assignedSiteId: "",
     quantity: 1,
+    singleUnitMode: false,
     unitType: DEFAULT_MACHINERY_UNIT_TYPE as PresetMachineryUnitType | typeof CUSTOM_MACHINERY_UNIT_VALUE,
     customUnitType: "",
   });
@@ -133,20 +163,66 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
 
   /** Sites that can receive newly assigned machinery (Super Admin: match selected company). */
   const sitesForAssignment = useMemo(() => {
-    if (user.role === "super_admin" && poolCompanyId) {
-      return sites.filter((s) => s.companyId === poolCompanyId);
+    const list =
+      user.role === "super_admin" && poolCompanyId
+        ? sites.filter((s) => s.companyId === poolCompanyId)
+        : sitesForForm;
+    if (lockAssignedSite && !list.some((s) => s.id === lockAssignedSite.id)) {
+      return [lockAssignedSite, ...list];
     }
-    return sitesForForm;
-  }, [user.role, poolCompanyId, sites, sitesForForm]);
+    return list;
+  }, [user.role, poolCompanyId, sites, sitesForForm, lockAssignedSite]);
 
   useEffect(() => {
+    if (lockAssignedSite?.companyId) {
+      setPoolCompanyId(lockAssignedSite.companyId);
+      return;
+    }
     if (companies.length && !poolCompanyId) setPoolCompanyId(companies[0].id);
     if (user.role !== "super_admin" && user.companyId) setPoolCompanyId(user.companyId);
-  }, [companies, poolCompanyId, user.companyId, user.role]);
+  }, [companies, poolCompanyId, user.companyId, user.role, lockAssignedSite?.companyId]);
+
+  useEffect(() => {
+    if (!open || !lockAssignedSite) return;
+    setMode("single");
+    setForm((prev) => ({
+      ...prev,
+      status: "assigned",
+      assignedSiteId: lockAssignedSite.id,
+    }));
+  }, [open, lockAssignedSite]);
 
   useEffect(() => {
     bulkWizardRef.current = bulkWizard;
   }, [bulkWizard]);
+
+  useEffect(() => {
+    if (!bulkWizard || !bulkOwnerCompanyId) return;
+    const item = bulkWizard.queue[bulkWizard.index];
+    if (!item || item.existingSite) return;
+    const resolved = existingSiteForBulkWizardConflict(
+      sites,
+      item.csvProjectName,
+      item.csvLocation,
+      bulkOwnerCompanyId,
+    );
+    if (!resolved) return;
+    setBulkWizard((prev) => {
+      if (!prev || prev.index !== bulkWizard.index) return prev;
+      const current = prev.queue[prev.index];
+      if (!current || current.key !== item.key || current.existingSite) return prev;
+      const queue = prev.queue.map((entry, idx) =>
+        idx === prev.index
+          ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+          : entry,
+      );
+      return {
+        ...prev,
+        queue,
+        ui: wizardUiSeed({ ...current, existingSite: resolved.site }),
+      };
+    });
+  }, [bulkWizard?.index, bulkWizard?.queue, bulkOwnerCompanyId, sites]);
 
   useEffect(() => {
     if (form.status !== "assigned" || sitesForAssignment.length === 0) return;
@@ -162,6 +238,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
   );
   const finalCategory = form.category === "__new__" ? form.customCategory.trim() : form.category.trim();
   const safeQuantity = Math.max(1, form.quantity);
+  const codegenQuantity = form.singleUnitMode ? 1 : safeQuantity;
 
   /** Stable snapshot so unit codegen does not re-run on every machinery query refetch. */
   const categoryMachineryKey = useMemo(() => {
@@ -173,51 +250,22 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       .join("\u0002");
   }, [finalCategory, machines]);
 
+  /** Company-wide codes affect uniqueness even across categories. */
+  const existingCodesKey = useMemo(
+    () =>
+      machines
+        .map((machine) => machine.code.toUpperCase())
+        .sort()
+        .join("\u0001"),
+    [machines],
+  );
+
   const suggestedUnits = useMemo(() => {
     if (!finalCategory) return [];
-    const categoryMachines = machines.filter((machine) => machine.category.toLowerCase() === finalCategory.toLowerCase());
+    return suggestMachineryUnits(finalCategory, machines, codegenQuantity);
+  }, [finalCategory, categoryMachineryKey, existingCodesKey, machines, codegenQuantity]);
 
-    const codeMatches = categoryMachines
-      .map((machine) => machine.code.match(/^([A-Za-z]+)([-_]?)(\d+)$/))
-      .filter((match): match is RegExpMatchArray => Boolean(match));
-    const maxCodeNumber = codeMatches.reduce(
-      (maxValue, match) => Math.max(maxValue, Number.parseInt(match[3], 10)),
-      0,
-    );
-    const lastCodeMatch = codeMatches.find(
-      (match) => Number.parseInt(match[3], 10) === maxCodeNumber,
-    );
-    const knownCategory = (MACHINERY_CATEGORIES as readonly string[]).find((c) => c.toLowerCase() === finalCategory.toLowerCase()) as
-      | MachineryCategory
-      | undefined;
-    const standardPrefix = knownCategory ? categoryCodePrefix[knownCategory] : toCodeChunk(finalCategory);
-    const codePrefix = lastCodeMatch?.[1] ?? standardPrefix;
-    const codeSeparator = lastCodeMatch?.[2] ?? "-";
-    const codeWidth = lastCodeMatch?.[3]?.length ?? 3;
-
-    const nameMatches = categoryMachines
-      .map((machine) => machine.name.match(/^(.*?)(\d+)\s*$/))
-      .filter((match): match is RegExpMatchArray => Boolean(match));
-    const maxNameNumber = nameMatches.reduce(
-      (maxValue, match) => Math.max(maxValue, Number.parseInt(match[2], 10)),
-      0,
-    );
-    const lastNameMatch = nameMatches.find(
-      (match) => Number.parseInt(match[2], 10) === maxNameNumber,
-    );
-    const nameBase = lastNameMatch?.[1] ?? `${finalCategory} `;
-
-    return Array.from({ length: safeQuantity }).map((_, index) => {
-      const codeNumber = maxCodeNumber + index + 1;
-      const nameNumber = maxNameNumber + index + 1;
-      return {
-        code: `${codePrefix}${codeSeparator}${String(codeNumber).padStart(codeWidth, "0")}`,
-        name: `${nameBase}${nameNumber}`,
-      };
-    });
-  }, [finalCategory, categoryMachineryKey, machines, safeQuantity]); // machines read when categoryMachineryKey changes
-
-  const unitCodegenKey = `${finalCategory}|${safeQuantity}|${categoryMachineryKey}`;
+  const unitCodegenKey = `${finalCategory}|${codegenQuantity}|${form.singleUnitMode}|${safeQuantity}|${categoryMachineryKey}|${existingCodesKey}`;
 
   useEffect(() => {
     setUnitEntries((prev) => {
@@ -240,9 +288,10 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     setForm({
       category: "",
       customCategory: "",
-      status: "available",
-      assignedSiteId: "",
+      status: lockAssignedSite ? "assigned" : "available",
+      assignedSiteId: lockAssignedSite?.id ?? "",
       quantity: 1,
+      singleUnitMode: false,
       unitType: DEFAULT_MACHINERY_UNIT_TYPE,
       customUnitType: "",
     });
@@ -261,40 +310,46 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
       toast({ title: "Missing category", description: "Select or add a machinery category.", variant: "destructive" });
       return;
     }
-    if (form.status === "assigned" && !form.assignedSiteId) {
+    if (!lockAssignedSite && form.status === "assigned" && !form.assignedSiteId) {
       toast({ title: "Missing site", description: "Select assigned site for assigned machinery.", variant: "destructive" });
       return;
     }
-    if (unitEntries.length !== safeQuantity) {
+    if (unitEntries.length !== codegenQuantity) {
       toast({ title: "Units not ready", description: "Please wait for unit details to generate.", variant: "destructive" });
       return;
     }
-    if (unitEntries.some((unit) => !unit.code.trim() || !unit.name.trim())) {
-      toast({ title: "Missing details", description: "Each unit must have a machinery code and name.", variant: "destructive" });
+    if (unitEntries.some((unit) => !unit.name.trim())) {
+      toast({ title: "Missing details", description: "Each unit must have a machinery name.", variant: "destructive" });
       return;
     }
-    const normalizedCodes = unitEntries.map((unit) => unit.code.trim().toUpperCase());
-    if (new Set(normalizedCodes).size !== normalizedCodes.length) {
+
+    const resolvedUnits = resolveMachineryUnitCodes(finalCategory, machines, unitEntries);
+    const providedCodes = unitEntries
+      .map((unit) => unit.code.trim().toUpperCase())
+      .filter(Boolean);
+    if (new Set(providedCodes).size !== providedCodes.length) {
       toast({ title: "Duplicate codes", description: "Each machinery code must be unique.", variant: "destructive" });
       return;
     }
     const existingCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
-    const conflictingCode = normalizedCodes.find((code) => existingCodes.has(code));
+    const conflictingCode = providedCodes.find((code) => existingCodes.has(code));
     if (conflictingCode) {
       toast({
         title: "Code already exists",
-        description: `${conflictingCode} is already used. Please edit and retry.`,
+        description: `${conflictingCode} is already used. Clear the code to auto-assign, or edit and retry.`,
         variant: "destructive",
       });
       return;
     }
 
-    const companyId = resolveMachineryCompanyId(
-      user,
-      sites,
-      form.status === "assigned" ? form.assignedSiteId || null : null,
-      user.role === "super_admin" ? poolCompanyId : null,
-    );
+    const companyId =
+      lockAssignedSite?.companyId ??
+      resolveMachineryCompanyId(
+        user,
+        sites,
+        form.status === "assigned" ? form.assignedSiteId || null : null,
+        user.role === "super_admin" ? poolCompanyId : null,
+      );
     if (!companyId) {
       toast({
         title: "Company required",
@@ -315,17 +370,33 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     addMachineryMutation.mutate(
       {
         category: finalCategory,
-        status: form.status,
-        assignedSiteId: form.status === "assigned" ? form.assignedSiteId : null,
+        status: lockAssignedSite ? "assigned" : form.status,
+        assignedSiteId: lockAssignedSite
+          ? lockAssignedSite.id
+          : form.status === "assigned"
+            ? form.assignedSiteId
+            : null,
         companyId,
         unitType: resolvedUnitType,
-        units: unitEntries,
+        units: resolvedUnits.map((unit) => ({
+          ...unit,
+          stockQuantity: form.singleUnitMode ? safeQuantity : 1,
+        })),
       },
       {
-        onSuccess: () => {
+        onSuccess: (result) => {
           toast({
             title: "Machinery added",
-            description: `${safeQuantity} unit${safeQuantity > 1 ? "s" : ""} created.`,
+            description: form.singleUnitMode
+              ? `1 entry created (${formatQtyWithUnit(safeQuantity, resolvedUnitType)}).`
+              : `${safeQuantity} unit${safeQuantity > 1 ? "s" : ""} created.`,
+          });
+          onCreated?.({
+            machineIds: result.machineIds,
+            category: finalCategory,
+            quantity: form.singleUnitMode ? safeQuantity : resolvedUnits.length,
+            unitType: resolvedUnitType,
+            label: finalCategory,
           });
           setOpen(false);
           resetForm();
@@ -649,10 +720,19 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     }
 
     const location = item.csvLocation.trim();
-    if (
-      siteDeploymentExists(sites, trimmed, location, ownerCompanyId, wiz.pendingNormNames) ||
-      siteNameTakenForCompany(trimmed, ownerCompanyId, sites, wiz.pendingNormNames)
-    ) {
+    if (siteDeploymentExists(sites, trimmed, location, ownerCompanyId, wiz.pendingNormNames)) {
+      const resolved = existingSiteForBulkWizardConflict(sites, trimmed, location, ownerCompanyId);
+      if (resolved) {
+        setBulkWizard((prev) => {
+          if (!prev || prev.index !== wiz.index) return prev;
+          const queue = prev.queue.map((entry, idx) =>
+            idx === prev.index
+              ? { ...entry, existingSite: resolved.site, locationMismatch: resolved.locationMismatch }
+              : entry,
+          );
+          return { ...prev, queue, ui: { mode: "case2-choice", nameDraft: trimmed } };
+        });
+      }
       toast({
         title: "Site already exists",
         description: `"${trimmed}" at "${location}" is already in your directory. Choose "Use existing site" to add machinery there, or enter a different site name.`,
@@ -688,6 +768,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
     }
   };
 
+  const selectMenuClass = nested ? "z-[160] max-h-72" : "z-[120] max-h-72";
+
   return (
     <>
     <Dialog
@@ -698,18 +780,30 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
         if (!nextOpen) resetForm();
       }}
     >
-      <Button type="button" onClick={() => setOpen(true)}>
-        <Plus className="h-4 w-4" /> {buttonText}
-      </Button>
-      <DialogContent className={mode === "bulk" ? "sm:max-w-6xl" : undefined}>
-        <DialogHeader>
+      {shouldShowTrigger ? (
+        <Button type="button" onClick={() => setOpen(true)}>
+          <Plus className="h-4 w-4" /> {buttonText}
+        </Button>
+      ) : null}
+      <DialogContent
+        overlayClassName={nested ? "z-[140]" : undefined}
+        className={cn(
+          "flex max-h-[90vh] flex-col overflow-hidden",
+          mode === "bulk" ? "sm:max-w-6xl" : undefined,
+          nested && "z-[150]",
+        )}
+      >
+        <DialogHeader className="shrink-0">
           <DialogTitle>Add new machinery</DialogTitle>
           <DialogDescription>
-            Create machinery units and optionally assign them to a site. Codes and names are auto-predicted but fully editable.
+            {lockAssignedSite
+              ? `Create machinery assigned to ${lockAssignedSite.name}. Names are required; machinery codes are optional and auto-assigned when left blank.`
+              : "Create machinery units and optionally assign them to a site. Names are required; machinery codes are optional and auto-assigned when left blank."}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-2 sm:grid-cols-2">
+        {!lockAssignedSite ? (
+        <div className="grid shrink-0 gap-2 sm:grid-cols-2">
           <button
             type="button"
             onClick={() => setMode("single")}
@@ -729,10 +823,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
             Bulk Upload
           </button>
         </div>
+        ) : null}
 
+        <div className="grid min-h-0 gap-4 overflow-y-auto pr-0.5">
         {mode === "single" ? (
           <>
-            {user.role === "super_admin" && (
+            {user.role === "super_admin" && !lockAssignedSite && (
               <div>
                 <label className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-muted-foreground">Company (equipment owner)</label>
                 <select
@@ -801,7 +897,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                             : form.unitType}
                         </SelectValue>
                       </SelectTrigger>
-                      <SelectContent position="popper" className="z-[120] max-h-72">
+                      <SelectContent position="popper" className={selectMenuClass}>
                         {MACHINERY_UNIT_TYPE_OPTIONS.map((opt) => (
                           <SelectItem key={opt.value} value={opt.value}>
                             {opt.label}
@@ -828,6 +924,15 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                     : form.unitType}{" "}
                   — e.g. pieces, metres, kg.
                 </p>
+                <label className="mt-3 flex cursor-pointer items-center gap-2.5 rounded-md border border-border/80 bg-muted/20 px-3 py-2.5">
+                  <Checkbox
+                    checked={form.singleUnitMode}
+                    onCheckedChange={(checked) =>
+                      setForm((current) => ({ ...current, singleUnitMode: checked === true }))
+                    }
+                  />
+                  <span className="text-sm font-medium leading-snug text-foreground">Select a single unit</span>
+                </label>
               </div>
 
               {form.category === "__new__" && (
@@ -842,6 +947,12 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                 </div>
               )}
 
+              {lockAssignedSite ? (
+                <p className="sm:col-span-2 text-xs text-muted-foreground">
+                  Assigned to {lockAssignedSite.name} ({lockAssignedSite.code}).
+                </p>
+              ) : (
+              <>
               <div>
                 <label className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-muted-foreground">Status</label>
                 <Select
@@ -862,7 +973,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   <SelectTrigger className="w-full border-border bg-card">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent position="popper" className="z-[120] max-h-72">
+                  <SelectContent position="popper" className={selectMenuClass}>
                     <SelectItem value="available">Available</SelectItem>
                     <SelectItem value="assigned">Assigned</SelectItem>
                     <SelectItem value="maintenance">Maintenance</SelectItem>
@@ -899,7 +1010,7 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                       }
                     />
                   </SelectTrigger>
-                  <SelectContent position="popper" className="z-[120] max-h-72">
+                  <SelectContent position="popper" className={selectMenuClass}>
                     {sitesForAssignment.map((site) => (
                       <SelectItem key={site.id} value={site.id}>
                         {site.name} ({site.code})
@@ -908,40 +1019,60 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                   </SelectContent>
                 </Select>
               </div>
+              </>
+              )}
             </div>
 
             {unitEntries.length > 0 && (
               <div className="rounded-md border border-border">
-                <div className="grid grid-cols-[1fr_1fr] border-b border-border bg-secondary/40 px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                  <div>Machinery code</div>
+                <div
+                  className={
+                    form.singleUnitMode
+                      ? "grid grid-cols-[1fr_1fr_5.5rem] border-b border-border bg-secondary/40 px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                      : "grid grid-cols-[1fr_1fr] border-b border-border bg-secondary/40 px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                  }
+                >
+                  <div>Machinery code (optional)</div>
                   <div>Machinery name</div>
+                  {form.singleUnitMode && <div className="text-right">Qty</div>}
                 </div>
-                <div className="max-h-56 overflow-y-auto p-2">
-                  <div className="space-y-2">
+                <div className="max-h-32 overflow-y-auto p-1.5">
+                  <div className="space-y-1.5">
                     {unitEntries.map((unit, index) => (
-                      <div key={index} className="grid grid-cols-[1fr_1fr] gap-2">
+                      <div
+                        key={index}
+                        className={
+                          form.singleUnitMode ? "grid grid-cols-[1fr_1fr_5.5rem] gap-1.5" : "grid grid-cols-[1fr_1fr] gap-1.5"
+                        }
+                      >
                         <input
-                          className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring/30"
+                          className="w-full rounded-md border border-border bg-card px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-ring/30"
                           value={unit.code}
+                          placeholder="Auto if blank"
                           onChange={(e) =>
                             setUnitEntries((current) =>
                               current.map((item, itemIndex) =>
-                                itemIndex === index ? { ...item, code: e.target.value } : item
-                              )
+                                itemIndex === index ? { ...item, code: e.target.value } : item,
+                              ),
                             )
                           }
                         />
                         <input
-                          className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring/30"
+                          className="w-full rounded-md border border-border bg-card px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-ring/30"
                           value={unit.name}
                           onChange={(e) =>
                             setUnitEntries((current) =>
                               current.map((item, itemIndex) =>
-                                itemIndex === index ? { ...item, name: e.target.value } : item
-                              )
+                                itemIndex === index ? { ...item, name: e.target.value } : item,
+                              ),
                             )
                           }
                         />
+                        {form.singleUnitMode && (
+                          <div className="flex items-center justify-end rounded-md border border-border bg-muted/30 px-2 py-1.5 text-sm font-medium tabular-nums text-foreground">
+                            {safeQuantity}
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -1096,8 +1227,9 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
             )}
           </div>
         )}
+        </div>
 
-        <DialogFooter>
+        <DialogFooter className="shrink-0 border-t border-border pt-4">
           {mode === "bulk" && bulkPreview ? (
             <>
               <Button type="button" variant="outline" disabled={bulkImporting} onClick={() => setBulkPreview(null)}>
@@ -1116,8 +1248,8 @@ export const AddMachineryDialog = ({ buttonText = "Add machinery" }: Props) => {
                 Cancel
               </Button>
               {mode === "single" ? (
-                <Button type="button" onClick={onCreate}>
-                  Create machinery
+                <Button type="button" onClick={onCreate} disabled={addMachineryMutation.isPending}>
+                  {addMachineryMutation.isPending ? "Creating…" : "Create machinery"}
                 </Button>
               ) : (
                 <Button type="button" onClick={() => onBulkPreview()} disabled={!bulkCsv.trim()}>

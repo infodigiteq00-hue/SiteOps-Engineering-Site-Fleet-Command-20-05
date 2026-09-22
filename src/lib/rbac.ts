@@ -6,7 +6,12 @@ export function hasSeniorManagerCapabilities(role: PlatformRole): boolean {
 }
 
 export function canCreateSite(role: PlatformRole): boolean {
-  return role === "firm_admin" || hasSeniorManagerCapabilities(role) || role === "super_admin";
+  return (
+    role === "firm_admin" ||
+    role === "store_manager" ||
+    hasSeniorManagerCapabilities(role) ||
+    role === "super_admin"
+  );
 }
 
 /** Firm Admin only — Team tab and user invites. */

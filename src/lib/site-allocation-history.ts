@@ -1,4 +1,5 @@
 import type { LedgerEntry, Machine, MachineryStatus } from "@/domain/types";
+import { DEFAULT_MACHINERY_UNIT_TYPE, normalizeMachineryUnitType, type MachineryUnitType } from "@/lib/machinery-unit-types";
 
 export type MachineryMovementDirection = "in" | "out";
 
@@ -31,16 +32,100 @@ export function isMovementEntry(entry: LedgerEntry): boolean {
   return entry.eventKind === "machinery_moved_in" || entry.eventKind === "machinery_moved_out";
 }
 
+export function isSiteClosureHistoryEntry(entry: LedgerEntry): boolean {
+  return entry.eventKind === "machinery_site_closure" || entry.eventKind === "site_marked_completed";
+}
+
 export function parseGatePassFromSummary(summary?: string): string {
   if (!summary) return "—";
   const match = summary.match(/Gate pass\s+([^·]+?)(?:\s*·|\s*\.?\s*$)/i);
   return match?.[1]?.trim() || "—";
 }
 
+export function parseInvoiceFromSummary(summary?: string): string {
+  if (!summary) return "";
+  const match = summary.match(/Invoice\s+([^·]+?)(?:\s*·|\s*\.?\s*$)/i);
+  return match?.[1]?.trim() || "";
+}
+
+export function parsePurchaseDateFromSummary(summary?: string): string {
+  if (!summary) return "";
+  const match = summary.match(/Purchase date\s+([^·]+?)(?:\s*·|\s*\.?\s*$)/i);
+  return match?.[1]?.trim() || "";
+}
+
+export type LatestArrivalInfo = {
+  gatePass: string;
+  dateIso: string;
+};
+
+/**
+ * Latest store→site arrival (`moved OUT`) per machine currently on a site.
+ * Date always comes from that ledger row; gate pass is empty when none was recorded.
+ */
+export function latestArrivalByMachineId(
+  siteId: string,
+  ledger: LedgerEntry[],
+): Map<string, LatestArrivalInfo> {
+  const map = new Map<string, LatestArrivalInfo>();
+  const movements = sortSiteHistoryEntries(
+    ledger.filter((e) => e.siteId === siteId && isMovementEntry(e)),
+  );
+
+  for (const entry of movements) {
+    // "out" = moved OUT from store to site (arrival on site)
+    if (classifySiteHistoryEntry(entry) !== "out") continue;
+    const parsedGate = parseGatePassFromSummary(entry.summary);
+    const info: LatestArrivalInfo = {
+      gatePass: parsedGate === "—" ? "" : parsedGate,
+      dateIso: movementDateIso(entry),
+    };
+    for (const machineId of entry.machineIds) {
+      if (!map.has(machineId)) map.set(machineId, info);
+    }
+  }
+
+  return map;
+}
+
+/** Latest gate pass per machine for units currently on a site. */
+export function latestArrivalGatePassByMachineId(
+  siteId: string,
+  ledger: LedgerEntry[],
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const [machineId, info] of latestArrivalByMachineId(siteId, ledger)) {
+    if (info.gatePass) map.set(machineId, info.gatePass);
+  }
+  return map;
+}
+
 export function parseMachineryFromSummary(summary?: string): string | null {
   if (!summary) return null;
   const match = summary.match(/Qty\s+(.+?)\s+(?:moved OUT|received IN)/i);
   return match?.[1]?.trim() ?? null;
+}
+
+/** Unit from ledger summary — supports `50 metre Qty …` and legacy `50 Qty …`. */
+export function parseUnitTypeFromSummary(summary?: string): MachineryUnitType {
+  if (!summary) return DEFAULT_MACHINERY_UNIT_TYPE;
+  const withUnit = summary.match(/^\d+\s+([a-zA-Z][\w/.-]*)\s+Qty\s+/i);
+  if (withUnit) return normalizeMachineryUnitType(withUnit[1]);
+  return DEFAULT_MACHINERY_UNIT_TYPE;
+}
+
+export function machineryLineKeyFromLabelAndCategory(label: string, category: string): string {
+  return `${normalizeMachineryGroupName(label)}::${category}`;
+}
+
+/** Best-effort category when ledger rows have no linked machinery ids. */
+export function inferMachineryCategoryFromLabel(label: string, machines: Machine[]): string {
+  const normalized = normalizeMachineryGroupName(label);
+  const byName = machines.find((m) => normalizeMachineryGroupName(m.name) === normalized);
+  if (byName) return byName.category;
+  const byCategory = machines.find((m) => m.category.toLowerCase() === label.trim().toLowerCase());
+  if (byCategory) return byCategory.category;
+  return "Machinery";
 }
 
 export function resolveMachineryDetails(entry: LedgerEntry, machines: Machine[]): string {
@@ -114,7 +199,19 @@ const RESERVED_SOURCE_POOL_LABELS = new Set([
   "maintenance",
   "lost_damaged",
   "lost/damaged",
+  NEW_MACHINES_POOL_LABEL.toLowerCase(),
 ]);
+
+/** Built-in Manage Machinery dropdown labels — never persisted as custom company rows. */
+export function isFixedMachinerySourceOptionLabel(label: string): boolean {
+  const lower = label.trim().toLowerCase();
+  return (
+    lower === "available" ||
+    lower === "assigned" ||
+    lower === "maintenance" ||
+    lower === NEW_MACHINES_POOL_LABEL.toLowerCase()
+  );
+}
 
 export function isReservedSourcePoolLabel(label: string): boolean {
   return RESERVED_SOURCE_POOL_LABELS.has(label.trim().toLowerCase());
@@ -182,7 +279,12 @@ export function parseMovementEditFromLedger(entry: LedgerEntry, machines: Machin
   const quantity = entry.totalUnits || machineIds.length || 1;
   const machineryLabel = resolveMachineryDetails(entry, machines);
   const firstMachine = machines.find((m) => machineIds.includes(m.id));
-  const lineKey = firstMachine ? machineryLineKey(firstMachine) : machineryLabel;
+  const category = firstMachine
+    ? firstMachine.category
+    : inferMachineryCategoryFromLabel(machineryLabel, machines);
+  const lineKey = firstMachine
+    ? machineryLineKey(firstMachine)
+    : machineryLineKeyFromLabelAndCategory(machineryLabel, category);
 
   return {
     ledgerId: entry.id,

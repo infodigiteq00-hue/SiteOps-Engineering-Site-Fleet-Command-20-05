@@ -1,13 +1,16 @@
 import { format, isValid, parseISO } from "date-fns";
-import type { LedgerEntry, Machine, Site, SiteClosureSummary } from "@/domain/types";
+import type { LedgerEntry, Machine, MachineryStatus, Site, SiteClosureSummary } from "@/domain/types";
 import {
   classifySiteHistoryEntry,
+  inferMachineryCategoryFromLabel,
   isMovementEntry,
   machineryGroupLabel,
   machineryLineKey,
+  machineryLineKeyFromLabelAndCategory,
   movementDateIso,
   parseGatePassFromSummary,
   parseMachineryFromSummary,
+  parseUnitTypeFromSummary,
   resolveMachineryDetails,
 } from "@/lib/site-allocation-history";
 import {
@@ -15,6 +18,7 @@ import {
   formatQtyWithUnit,
   type MachineryUnitType,
 } from "@/lib/machinery-unit-types";
+import { machineryStockQuantity } from "@/lib/site-closure";
 
 export type SiteMovementLine = {
   dateIso: string;
@@ -25,6 +29,7 @@ export type SiteMovementLine = {
   gatePass: string;
   machinery: string;
   category: string;
+  ledgerEntryId: string;
 };
 
 export type SiteCategoryReport = {
@@ -32,18 +37,36 @@ export type SiteCategoryReport = {
   category: string;
   machineryLabel: string;
   currentlyOnSite: number;
+  unitType: MachineryUnitType;
   movements: SiteMovementLine[];
 };
 
-/** One table row for export — IN or OUT columns filled per movement line */
+/** One table row for export — IN/OUT columns filled per movement line */
 export type SimpleSiteReportRow = {
   machineryName: string;
-  onSiteToday: number;
-  /** Gate pass + date combined */
-  inDetail: string;
+  /** e.g. "3 nos at site" */
+  onSiteToday: string;
+  /** IN — from site to store */
   inQty: string;
-  outDetail: string;
+  inDate: string;
+  inGatePass: string;
+  /** OUT — from store to site */
   outQty: string;
+  outDate: string;
+  outGatePass: string;
+};
+
+/** One row in the site detail assigned-machinery table (movement IN/OUT paired). */
+export type AssignedMachineryTableRow = {
+  date: string;
+  name: string;
+  inQty: string;
+  outQty: string;
+  inGatePass: string;
+  outGatePass: string;
+  status: MachineryStatus;
+  machineId?: string;
+  ledgerEntryId?: string;
 };
 
 export type SiteReport = {
@@ -65,16 +88,6 @@ function formatReportDate(iso: string): string {
   return format(parsed, "dd-MMM-yyyy");
 }
 
-/** Gate pass + date in one cell, e.g. "501 (15-May-2026)" */
-export function formatMovementDetail(gatePass: string, dateLabel: string): string {
-  const gp = gatePass.trim();
-  const hasGp = Boolean(gp && gp !== "—" && gp !== "0");
-  if (!dateLabel && !hasGp) return "";
-  if (!hasGp) return dateLabel;
-  if (!dateLabel) return `GP ${gp}`;
-  return `${gp} (${dateLabel})`;
-}
-
 function displayMachineryName(category: string, label: string): string {
   if (label && category && !label.toLowerCase().includes(category.toLowerCase())) {
     return `${label} (${category})`;
@@ -88,34 +101,72 @@ function machineryLabelForEntry(entry: LedgerEntry, machines: Machine[]): string
   return resolveMachineryDetails(entry, machines);
 }
 
-function lineKeyForEntry(entry: LedgerEntry, machines: Machine[]): string {
-  const linked = entry.machineIds
+function linkedMachinesForEntry(entry: LedgerEntry, machines: Machine[]): Machine[] {
+  return entry.machineIds
     .map((id) => machines.find((m) => m.id === id))
     .filter((m): m is Machine => Boolean(m));
-  if (linked.length > 0) return machineryLineKey(linked[0]);
+}
+
+function machineryLabelForLineKey(entry: LedgerEntry, machines: Machine[]): string {
   return parseMachineryFromSummary(entry.summary) ?? resolveMachineryDetails(entry, machines);
 }
 
+function lineKeyForEntry(entry: LedgerEntry, machines: Machine[]): string {
+  const linked = linkedMachinesForEntry(entry, machines);
+  if (linked.length > 0) return machineryLineKey(linked[0]);
+  const label = machineryLabelForLineKey(entry, machines);
+  const category = inferMachineryCategoryFromLabel(label, machines);
+  return machineryLineKeyFromLabelAndCategory(label, category);
+}
+
 function categoryForEntry(entry: LedgerEntry, machines: Machine[]): string {
-  const linked = entry.machineIds
-    .map((id) => machines.find((m) => m.id === id))
-    .filter((m): m is Machine => Boolean(m));
+  const linked = linkedMachinesForEntry(entry, machines);
   if (linked.length > 0) return linked[0].category;
-  return "Machinery";
+  return inferMachineryCategoryFromLabel(machineryLabelForLineKey(entry, machines), machines);
 }
 
 function unitTypeForEntry(entry: LedgerEntry, machines: Machine[]): MachineryUnitType {
-  const linked = entry.machineIds
-    .map((id) => machines.find((m) => m.id === id))
-    .filter((m): m is Machine => Boolean(m));
-  if (linked.length === 0) return DEFAULT_MACHINERY_UNIT_TYPE;
-  const types = new Set(linked.map((m) => m.unitType));
-  if (types.size === 1) return linked[0].unitType;
-  return linked[0].unitType;
+  const linked = linkedMachinesForEntry(entry, machines);
+  if (linked.length > 0) return linked[0].unitType;
+  return parseUnitTypeFromSummary(entry.summary);
 }
 
-function emptyMovementCells(): Pick<SimpleSiteReportRow, "inDetail" | "inQty" | "outDetail" | "outQty"> {
-  return { inDetail: "", inQty: "", outDetail: "", outQty: "" };
+/** Net quantity on site: OUT (store→site) adds stock, IN (site→store) removes it. */
+function netOnSiteFromMovements(movements: SiteMovementLine[]): number {
+  return movements.reduce((sum, m) => (m.type === "OUT" ? sum + m.quantity : sum - m.quantity), 0);
+}
+
+function emptyMovementCells(): Pick<
+  SimpleSiteReportRow,
+  "inQty" | "inDate" | "inGatePass" | "outQty" | "outDate" | "outGatePass"
+> {
+  return { inQty: "", inDate: "", inGatePass: "", outQty: "", outDate: "", outGatePass: "" };
+}
+
+function gatePassCell(gatePass: string): string {
+  const gp = gatePass.trim();
+  return gp && gp !== "—" ? gp : "";
+}
+
+function formatOnSiteToday(count: number, unitType: MachineryUnitType): string {
+  if (count <= 0) return "—";
+  return `${formatQtyWithUnit(count, unitType)} at site`;
+}
+
+function movementInCells(m: SiteMovementLine): Pick<SimpleSiteReportRow, "inQty" | "inDate" | "inGatePass"> {
+  return {
+    inQty: formatQtyWithUnit(m.quantity, m.unitType),
+    inDate: m.dateLabel,
+    inGatePass: gatePassCell(m.gatePass),
+  };
+}
+
+function movementOutCells(m: SiteMovementLine): Pick<SimpleSiteReportRow, "outQty" | "outDate" | "outGatePass"> {
+  return {
+    outQty: formatQtyWithUnit(m.quantity, m.unitType),
+    outDate: m.dateLabel,
+    outGatePass: gatePassCell(m.gatePass),
+  };
 }
 
 export function buildSimpleReportRows(categories: SiteCategoryReport[]): SimpleSiteReportRow[] {
@@ -123,28 +174,123 @@ export function buildSimpleReportRows(categories: SiteCategoryReport[]): SimpleS
 
   for (const cat of categories) {
     const name = displayMachineryName(cat.category, cat.machineryLabel);
+    const onSiteToday = formatOnSiteToday(cat.currentlyOnSite, cat.unitType);
 
     if (cat.movements.length === 0) {
       rows.push({
         machineryName: name,
-        onSiteToday: cat.currentlyOnSite,
+        onSiteToday,
         ...emptyMovementCells(),
       });
       continue;
     }
 
-    for (const m of cat.movements) {
+    const inMovements = cat.movements.filter((m) => m.type === "IN");
+    const outMovements = cat.movements.filter((m) => m.type === "OUT");
+    const rowCount = Math.max(inMovements.length, outMovements.length);
+
+    for (let i = 0; i < rowCount; i++) {
+      const inM = inMovements[i];
+      const outM = outMovements[i];
       rows.push({
         machineryName: name,
-        onSiteToday: cat.currentlyOnSite,
-        inDetail:
-          m.type === "IN" ? formatMovementDetail(m.gatePass || "—", m.dateLabel) : "",
-        inQty: m.type === "IN" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
-        outDetail:
-          m.type === "OUT" ? formatMovementDetail(m.gatePass || "—", m.dateLabel) : "",
-        outQty: m.type === "OUT" ? formatQtyWithUnit(m.quantity, m.unitType) : "",
+        onSiteToday,
+        ...(inM ? movementInCells(inM) : { inQty: "", inDate: "", inGatePass: "" }),
+        ...(outM ? movementOutCells(outM) : { outQty: "", outDate: "", outGatePass: "" }),
       });
     }
+  }
+
+  return rows;
+}
+
+function machineryStatusForLine(machinesInLine: Machine[]): MachineryStatus {
+  if (machinesInLine.length === 0) return "assigned";
+  const statuses = new Set(machinesInLine.map((m) => m.status));
+  if (statuses.size === 1) return machinesInLine[0]!.status;
+  return "assigned";
+}
+
+/** Movement rows for the assigned-machinery accordion table on site detail. */
+export function buildAssignedMachineryTableRows(
+  category: string,
+  site: Site,
+  ledger: LedgerEntry[],
+  machines: Machine[],
+  machinesInCategory?: Machine[],
+): AssignedMachineryTableRow[] {
+  const assignedInCategory =
+    machinesInCategory ?? machines.filter((m) => m.assignedSiteId === site.id && m.category === category);
+  const lineKeysInView = new Set(assignedInCategory.map((m) => machineryLineKey(m)));
+  const report = buildSiteReport(site, ledger, machines, null);
+  const categoryReports = report.categories.filter(
+    (c) => c.category === category && (lineKeysInView.size === 0 || lineKeysInView.has(c.lineKey)),
+  );
+  const rows: AssignedMachineryTableRow[] = [];
+
+  for (const catReport of categoryReports) {
+    const machinesInLine = assignedInCategory.filter((m) => machineryLineKey(m) === catReport.lineKey);
+    const status = machineryStatusForLine(machinesInLine);
+    const machineId = machinesInLine[0]?.id;
+    const name = displayMachineryName(catReport.category, catReport.machineryLabel);
+    const inMovements = catReport.movements.filter((m) => m.type === "IN");
+    const outMovements = catReport.movements.filter((m) => m.type === "OUT");
+
+    if (catReport.movements.length === 0) {
+      rows.push({
+        date: "",
+        name,
+        inQty: "",
+        outQty: "",
+        inGatePass: "",
+        outGatePass: "",
+        status,
+        machineId,
+      });
+      continue;
+    }
+
+    const rowCount = Math.max(inMovements.length, outMovements.length);
+    for (let i = 0; i < rowCount; i++) {
+      const inM = inMovements[i];
+      const outM = outMovements[i];
+      rows.push({
+        date: outM?.dateLabel || inM?.dateLabel || "",
+        name,
+        inQty: inM ? formatQtyWithUnit(inM.quantity, inM.unitType) : "",
+        outQty: outM ? formatQtyWithUnit(outM.quantity, outM.unitType) : "",
+        inGatePass: inM?.gatePass ?? "",
+        outGatePass: outM?.gatePass ?? "",
+        status,
+        machineId,
+        ledgerEntryId: outM?.ledgerEntryId ?? inM?.ledgerEntryId,
+      });
+    }
+  }
+
+  const coveredKeys = new Set(categoryReports.map((c) => c.lineKey));
+  const uncoveredLines = new Map<string, Machine[]>();
+  for (const machine of assignedInCategory) {
+    const key = machineryLineKey(machine);
+    if (coveredKeys.has(key)) continue;
+    const list = uncoveredLines.get(key) ?? [];
+    list.push(machine);
+    uncoveredLines.set(key, list);
+  }
+
+  for (const lineMachines of uncoveredLines.values()) {
+    const first = lineMachines[0];
+    if (!first) continue;
+    rows.push({
+      date: "",
+      name: first.name,
+      inQty: "",
+      outQty: "",
+      inGatePass: "",
+      outGatePass: "",
+      status: machineryStatusForLine(lineMachines),
+      machineId: first.id,
+    });
   }
 
   return rows;
@@ -180,6 +326,7 @@ export function buildSiteReport(
       gatePass: gatePass === "—" ? "" : gatePass,
       machinery: machineryLabel,
       category,
+      ledgerEntryId: entry.id,
     };
 
     const bucket =
@@ -189,6 +336,7 @@ export function buildSiteReport(
         category,
         machineryLabel,
         currentlyOnSite: 0,
+        unitType: unitTypeForEntry(entry, machines),
         movements: [],
       } satisfies SiteCategoryReport);
 
@@ -196,14 +344,23 @@ export function buildSiteReport(
     categoryMap.set(lineKey, bucket);
   }
 
-  const onSiteByLine = new Map<string, { count: number; category: string; label: string }>();
+  const onSiteByLine = new Map<
+    string,
+    { count: number; category: string; label: string; unitType: MachineryUnitType }
+  >();
   for (const machine of machines.filter((m) => m.assignedSiteId === site.id)) {
     const key = machineryLineKey(machine);
     const existing = onSiteByLine.get(key);
+    const qty = machineryStockQuantity(machine);
     if (existing) {
-      existing.count += 1;
+      existing.count += qty;
     } else {
-      onSiteByLine.set(key, { count: 1, category: machine.category, label: machineryGroupLabel(machine) });
+      onSiteByLine.set(key, {
+        count: qty,
+        category: machine.category,
+        label: machineryGroupLabel(machine),
+        unitType: machine.unitType,
+      });
     }
   }
 
@@ -213,10 +370,25 @@ export function buildSiteReport(
       category: info.category,
       machineryLabel: info.label,
       currentlyOnSite: 0,
+      unitType: info.unitType,
       movements: [],
     };
     bucket.currentlyOnSite = info.count;
+    bucket.unitType = info.unitType;
     categoryMap.set(key, bucket);
+  }
+
+  for (const bucket of categoryMap.values()) {
+    const movementNet = netOnSiteFromMovements(bucket.movements);
+    if (movementNet > bucket.currentlyOnSite) {
+      bucket.currentlyOnSite = movementNet;
+    }
+    if (bucket.movements.length > 0 && bucket.unitType === DEFAULT_MACHINERY_UNIT_TYPE) {
+      const last = bucket.movements[bucket.movements.length - 1];
+      if (last.unitType !== DEFAULT_MACHINERY_UNIT_TYPE) {
+        bucket.unitType = last.unitType;
+      }
+    }
   }
 
   const categories = Array.from(categoryMap.values()).sort(

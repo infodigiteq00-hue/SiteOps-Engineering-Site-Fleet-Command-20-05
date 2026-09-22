@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { persistOperationalCache, restoreOperationalCache } from "@/lib/query-persist";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
@@ -28,10 +29,13 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       retry: 2,
+      staleTime: 60_000,
       refetchOnWindowFocus: false,
     },
   },
 });
+restoreOperationalCache(queryClient);
+persistOperationalCache(queryClient);
 
 const App = () => (
   <AuthProvider>

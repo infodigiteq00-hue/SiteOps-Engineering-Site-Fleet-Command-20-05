@@ -12,23 +12,21 @@ import {
   isReservedSourcePoolLabel,
   isSavedCustomStatusSelect,
   labelFromCustomStatusSelect,
-  machineryGroupLabel,
-  machineryLineKey,
   movementDirectionDisplayLabel,
   parseMovementEditFromLedger,
   type MachineryMovementDirection,
 } from "@/lib/site-allocation-history";
-import { seedCategoryCodegen, takeMachineryUnitsFromCursor } from "@/lib/machinery-unit-codegen";
+import { buildMachineryLineSelections, selectMachineIdsForQuantity } from "@/lib/machinery-movement-selection";
 import {
   CUSTOM_MACHINERY_UNIT_VALUE,
   DEFAULT_MACHINERY_UNIT_TYPE,
   MACHINERY_UNIT_TYPE_OPTIONS,
+  formatQtyWithUnit,
   resolveMachineryUnitType,
   type MachineryUnitType,
   type PresetMachineryUnitType,
 } from "@/lib/machinery-unit-types";
 import {
-  useAddMachineryMutation,
   useMachinerySourceStatusesQuery,
   useRecordMachineryMovementMutation,
   useUpdateMachineryMovementMutation,
@@ -56,6 +54,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { toast } from "@/hooks/use-toast";
+import { AddMachineryDialog, type CreatedMachineryBatch } from "@/components/AddMachineryDialog";
 
 type Props = {
   site: Site;
@@ -107,25 +106,6 @@ function getEligibleMachines(
   return Array.from(byId.values());
 }
 
-function buildMachineryLines(eligible: Machine[]): MachineryLine[] {
-  const grouped = new Map<string, { label: string; machineIds: string[] }>();
-  const sorted = [...eligible].sort((a, b) => a.code.localeCompare(b.code));
-
-  for (const machine of sorted) {
-    const key = machineryLineKey(machine);
-    const entry = grouped.get(key) ?? { label: machineryGroupLabel(machine), machineIds: [] };
-    entry.machineIds.push(machine.id);
-    grouped.set(key, entry);
-  }
-
-  return Array.from(grouped.entries()).map(([key, entry]) => ({
-    key,
-    label: entry.label,
-    machineIds: entry.machineIds,
-    availableCount: entry.machineIds.length,
-  }));
-}
-
 function MotionField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="space-y-2">
@@ -137,7 +117,7 @@ function MotionField({ label, children }: { label: string; children: ReactNode }
 
 function defaultFormState() {
   return {
-    direction: "out" as MachineryMovementDirection,
+    direction: "in" as MachineryMovementDirection,
     sourceStatus: "available" as MachineryStatus,
     movementDate: format(new Date(), "yyyy-MM-dd"),
     gatePassNumber: "",
@@ -156,7 +136,6 @@ export function ManageMachineryDialog({
 }: Props) {
   const recordMutation = useRecordMachineryMovementMutation();
   const updateMutation = useUpdateMachineryMovementMutation();
-  const addMachineryMutation = useAddMachineryMutation();
   const { data: savedCustomStatuses = [] } = useMachinerySourceStatusesQuery(site.companyId);
   const [internalOpen, setInternalOpen] = useState(false);
   const isControlled = controlledOpen !== undefined;
@@ -170,8 +149,10 @@ export function ManageMachineryDialog({
     [editEntry, machines],
   );
   const originalSnapshot = useRef(editDraft);
+  /** Avoid re-initializing the form when query data refreshes while the dialog stays open. */
+  const formInitSessionRef = useRef<string | null>(null);
 
-  const [direction, setDirection] = useState<MachineryMovementDirection>("out");
+  const [direction, setDirection] = useState<MachineryMovementDirection>("in");
   const [sourceSelect, setSourceSelect] = useState<string>("available");
   const [sourceStatus, setSourceStatus] = useState<MachineryStatus>("available");
   const [customSourceStatus, setCustomSourceStatus] = useState("");
@@ -188,6 +169,8 @@ export function ManageMachineryDialog({
     DEFAULT_MACHINERY_UNIT_TYPE,
   );
   const [customUnitType, setCustomUnitType] = useState("");
+  const [addMachineryOpen, setAddMachineryOpen] = useState(false);
+  const [newMachinesBatch, setNewMachinesBatch] = useState<CreatedMachineryBatch | null>(null);
 
   const isStoreToSite = direction === "in";
   const isLegacyCustomDraft = sourceSelect === CUSTOM_MOVEMENT_SOURCE_VALUE;
@@ -228,7 +211,7 @@ export function ManageMachineryDialog({
     [direction, sourceStatus, site.id, machines, includeMachineIds, isCustomPool, isNewMachinesMode],
   );
 
-  const machineryLines = useMemo(() => buildMachineryLines(eligibleMachines), [eligibleMachines]);
+  const machineryLines = useMemo(() => buildMachineryLineSelections(eligibleMachines), [eligibleMachines]);
 
   const selectedLine = useMemo(
     () => machineryLines.find((line) => line.key === selectedLineKey) ?? null,
@@ -236,11 +219,18 @@ export function ManageMachineryDialog({
   );
 
   const maxQuantity = isCustomPool || isNewMachinesMode ? 0 : (selectedLine?.availableCount ?? 0);
-  const isPending =
-    recordMutation.isPending || updateMutation.isPending || addMachineryMutation.isPending;
+  const isPending = recordMutation.isPending || updateMutation.isPending;
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      formInitSessionRef.current = null;
+      return;
+    }
+
+    const sessionKey = editEntry?.id ?? "new";
+    if (formInitSessionRef.current === sessionKey) return;
+    formInitSessionRef.current = sessionKey;
+
     if (editDraft) {
       originalSnapshot.current = editDraft;
       setDirection(editDraft.direction);
@@ -283,8 +273,8 @@ export function ManageMachineryDialog({
     }
     const defaults = defaultFormState();
     setDirection(defaults.direction);
-    setSourceSelect("assigned");
-    setSourceStatus("assigned");
+    setSourceSelect("available");
+    setSourceStatus("available");
     setCustomSourceStatus("");
     setCustomMachineryName("");
     setMovementDate(defaults.movementDate);
@@ -295,7 +285,10 @@ export function ManageMachineryDialog({
     setCustomCategory("");
     setUnitType(DEFAULT_MACHINERY_UNIT_TYPE);
     setCustomUnitType("");
-  }, [open, editDraft, savedCustomStatuses, categoryOptions]);
+    setAddMachineryOpen(false);
+    setNewMachinesBatch(null);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- init once per open/edit session
+  }, [open, editEntry?.id]);
 
   useEffect(() => {
     if (!open || isEditing || isCustomPool || isNewMachinesMode) return;
@@ -311,6 +304,8 @@ export function ManageMachineryDialog({
       setSourceStatus("assigned");
       setCategorySelect("");
       setCustomCategory("");
+      setAddMachineryOpen(false);
+      setNewMachinesBatch(null);
     }
   }, [isStoreToSite, isNewMachinesMode, open, isEditing]);
 
@@ -342,9 +337,27 @@ export function ManageMachineryDialog({
     setCustomCategory("");
     setUnitType(DEFAULT_MACHINERY_UNIT_TYPE);
     setCustomUnitType("");
+    setAddMachineryOpen(false);
+    setNewMachinesBatch(null);
   };
 
   const handleSubmit = () => {
+    const movementUnitType: MachineryUnitType =
+      isNewMachinesMode
+        ? isEditing
+          ? resolvedUnitType ??
+            (() => {
+              const id = originalSnapshot.current?.machineIds[0];
+              return id ? (machines.find((m) => m.id === id)?.unitType ?? DEFAULT_MACHINERY_UNIT_TYPE) : DEFAULT_MACHINERY_UNIT_TYPE;
+            })()
+          : newMachinesBatch?.unitType ?? DEFAULT_MACHINERY_UNIT_TYPE
+        : (() => {
+            const id =
+              selectedLine?.machineIds[0] ??
+              (isEditing && editDraft?.machineIds[0] ? editDraft.machineIds[0] : undefined);
+            return id ? (machines.find((m) => m.id === id)?.unitType ?? DEFAULT_MACHINERY_UNIT_TYPE) : DEFAULT_MACHINERY_UNIT_TYPE;
+          })();
+
     if (isNewMachinesMode) {
       if (isEditing && originalSnapshot.current) {
         const movementPayload = {
@@ -359,6 +372,7 @@ export function ManageMachineryDialog({
           machineIds: originalSnapshot.current.machineIds,
           machineryLabel: finalCategory || originalSnapshot.current.machineryLabel,
           quantity,
+          unitType: movementUnitType,
         };
         updateMutation.mutate(
           {
@@ -396,90 +410,49 @@ export function ManageMachineryDialog({
         });
         return;
       }
-      if (!finalCategory) {
-        toast({ title: "Category required", description: "Select or enter a machinery category.", variant: "destructive" });
-        return;
-      }
-      if (!resolvedUnitType) {
-        toast({ title: "Unit type required", description: "Enter a unit type (e.g. nos, metre).", variant: "destructive" });
-        return;
-      }
-      if (quantity < 1) {
-        toast({ title: "Invalid quantity", description: "Enter a quantity of 1 or more.", variant: "destructive" });
-        return;
-      }
-
-      const reservedCodes = new Set(machines.map((m) => m.code.toUpperCase()));
-      const cursor = seedCategoryCodegen(finalCategory, machines, reservedCodes);
-      const generated = takeMachineryUnitsFromCursor(cursor, quantity, reservedCodes);
-      const units = generated.map((unit) => ({
-        ...unit,
-        projectName: site.name,
-        projectLocation: site.location,
-      }));
-
-      const displayLabel = movementDirectionDisplayLabel(direction);
-      const onSuccess = () => {
+      if (!newMachinesBatch || newMachinesBatch.machineIds.length === 0) {
         toast({
-          title: isEditing ? "Movement updated" : `Movement ${displayLabel} recorded`,
-          description: `${quantity} new ${finalCategory} unit(s) added to ${site.name}.`,
-        });
-        resetAndClose();
-      };
-      const onError = (err: Error) => {
-        toast({
-          title: isEditing ? "Could not update" : "Could not record movement",
-          description: err instanceof Error ? err.message : "Try again.",
+          title: "Add machinery first",
+          description: "Create the new machines, then record the movement with date and gate pass.",
           variant: "destructive",
         });
-      };
+        setAddMachineryOpen(true);
+        return;
+      }
 
-      void (async () => {
-        try {
-          const { machineIds } = await addMachineryMutation.mutateAsync({
-            category: finalCategory,
-            status: "assigned",
-            assignedSiteId: site.id,
-            companyId: site.companyId,
-            unitType: resolvedUnitType,
-            units,
-          });
-
-          const movementPayload = {
-            siteId: site.id,
-            siteName: site.name,
-            companyId: site.companyId,
-            direction,
-            sourceStatus: "assigned" as MachineryStatus,
-            customSourceStatus: NEW_MACHINES_POOL_LABEL,
-            movementDate,
-            gatePassNumber: gatePassNumber.trim() || undefined,
-            machineIds,
-            machineryLabel: finalCategory,
-            quantity,
-          };
-
-          if (isEditing && originalSnapshot.current) {
-            await updateMutation.mutateAsync({
-              ...movementPayload,
-              ledgerEntryId: originalSnapshot.current.ledgerId,
-              original: {
-                direction: originalSnapshot.current.direction,
-                sourceStatus: originalSnapshot.current.sourceStatus,
-                customSourceStatus: originalSnapshot.current.isCustomSource
-                  ? originalSnapshot.current.customSourceLabel
-                  : undefined,
-                machineIds: originalSnapshot.current.machineIds,
-              },
+      const displayLabel = movementDirectionDisplayLabel(direction);
+      recordMutation.mutate(
+        {
+          siteId: site.id,
+          siteName: site.name,
+          companyId: site.companyId,
+          direction,
+          sourceStatus: "assigned" as MachineryStatus,
+          customSourceStatus: NEW_MACHINES_POOL_LABEL,
+          movementDate,
+          gatePassNumber: gatePassNumber.trim() || undefined,
+          machineIds: newMachinesBatch.machineIds,
+          machineryLabel: newMachinesBatch.category,
+          quantity: newMachinesBatch.quantity,
+          unitType: newMachinesBatch.unitType,
+        },
+        {
+          onSuccess: () => {
+            toast({
+              title: `Movement ${displayLabel} recorded`,
+              description: `${formatQtyWithUnit(newMachinesBatch.quantity, newMachinesBatch.unitType)} ${newMachinesBatch.category} logged for ${site.name}.`,
             });
-          } else {
-            await recordMutation.mutateAsync(movementPayload);
-          }
-          onSuccess();
-        } catch (err) {
-          onError(err instanceof Error ? err : new Error("Try again."));
-        }
-      })();
+            resetAndClose();
+          },
+          onError: (err: Error) => {
+            toast({
+              title: "Could not record movement",
+              description: err instanceof Error ? err.message : "Try again.",
+              variant: "destructive",
+            });
+          },
+        },
+      );
       return;
     }
 
@@ -519,6 +492,7 @@ export function ManageMachineryDialog({
         machineIds: [] as string[],
         machineryLabel: machineryName,
         quantity,
+        unitType: movementUnitType,
       };
 
       const displayLabel = movementDirectionDisplayLabel(direction);
@@ -572,7 +546,8 @@ export function ManageMachineryDialog({
       return;
     }
 
-    const machineIds = selectedLine.machineIds.slice(0, quantity);
+    const machinesById = new Map(machines.map((m) => [m.id, m]));
+    const machineIds = selectMachineIdsForQuantity(selectedLine.machineIds, machinesById, quantity);
     const payload = {
       siteId: site.id,
       siteName: site.name,
@@ -584,6 +559,7 @@ export function ManageMachineryDialog({
       machineIds,
       machineryLabel: selectedLine.label,
       quantity,
+      unitType: movementUnitType,
     };
 
     const displayLabel = movementDirectionDisplayLabel(direction);
@@ -625,7 +601,14 @@ export function ManageMachineryDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next && addMachineryOpen) return;
+        setOpen(next);
+      }}
+    >
       {shouldShowTrigger && (
         <DialogTrigger asChild>
           <Button type="button" variant="outline" className="gap-1.5 border-border font-semibold shadow-card">
@@ -634,8 +617,19 @@ export function ManageMachineryDialog({
           </Button>
         </DialogTrigger>
       )}
-      <DialogContent className="overflow-visible sm:max-w-lg">
-        <DialogHeader>
+      <DialogContent
+        className="flex max-h-[90vh] flex-col overflow-hidden sm:max-w-lg"
+        onPointerDownOutside={(event) => {
+          if (addMachineryOpen) event.preventDefault();
+        }}
+        onInteractOutside={(event) => {
+          if (addMachineryOpen) event.preventDefault();
+        }}
+        onFocusOutside={(event) => {
+          if (addMachineryOpen) event.preventDefault();
+        }}
+      >
+        <DialogHeader className="shrink-0">
           <DialogTitle className="font-display">{isEditing ? "Edit movement" : "Manage Machinery"}</DialogTitle>
           <DialogDescription>
             {isEditing ? (
@@ -654,34 +648,54 @@ export function ManageMachineryDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-y-contain pr-1">
           <MotionField label="Movement direction">
             <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-secondary/40 p-1">
               <button
                 type="button"
                 onClick={() => setDirection("in")}
                 className={cn(
-                  "flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold transition-all",
+                  "flex flex-col items-center justify-center gap-0.5 rounded-md px-3 py-2.5 transition-all",
                   direction === "in"
                     ? "bg-emerald-600 text-white shadow-sm"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <ArrowUpFromLine className="h-4 w-4" />
-                OUT
+                <span className="flex items-center gap-1.5 text-sm font-semibold">
+                  <ArrowUpFromLine className="h-4 w-4 shrink-0" />
+                  OUT
+                </span>
+                <span
+                  className={cn(
+                    "text-[10px] font-medium leading-tight",
+                    direction === "in" ? "text-white/85" : "text-muted-foreground",
+                  )}
+                >
+                  (From Store to Site)
+                </span>
               </button>
               <button
                 type="button"
                 onClick={() => setDirection("out")}
                 className={cn(
-                  "flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold transition-all",
+                  "flex flex-col items-center justify-center gap-0.5 rounded-md px-3 py-2.5 transition-all",
                   direction === "out"
                     ? "bg-amber-600 text-white shadow-sm"
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                <ArrowDownToLine className="h-4 w-4" />
-                IN
+                <span className="flex items-center gap-1.5 text-sm font-semibold">
+                  <ArrowDownToLine className="h-4 w-4 shrink-0" />
+                  IN
+                </span>
+                <span
+                  className={cn(
+                    "text-[10px] font-medium leading-tight",
+                    direction === "out" ? "text-white/85" : "text-muted-foreground",
+                  )}
+                >
+                  (From Site to Store)
+                </span>
               </button>
             </div>
           </MotionField>
@@ -690,6 +704,10 @@ export function ManageMachineryDialog({
             <Select
               value={sourceSelect}
               onValueChange={(v) => {
+                if (v !== NEW_MACHINES_SOURCE_VALUE) {
+                  setAddMachineryOpen(false);
+                  setNewMachinesBatch(null);
+                }
                 if (v === NEW_MACHINES_SOURCE_VALUE) {
                   setSourceSelect(NEW_MACHINES_SOURCE_VALUE);
                   setCustomSourceStatus("");
@@ -697,6 +715,7 @@ export function ManageMachineryDialog({
                   setSelectedLineKey("");
                   setCategorySelect("");
                   setCustomCategory("");
+                  if (!isEditing) setAddMachineryOpen(true);
                   return;
                 }
                 if (isSavedCustomStatusSelect(v)) {
@@ -724,11 +743,6 @@ export function ManageMachineryDialog({
                     {opt.label}
                   </SelectItem>
                 ))}
-                {savedCustomStatuses.map((row) => (
-                  <SelectItem key={row.id} value={customStatusSelectValue(row.label)}>
-                    {row.label}
-                  </SelectItem>
-                ))}
                 {isStoreToSite ? (
                   <SelectItem value={NEW_MACHINES_SOURCE_VALUE}>{NEW_MACHINES_POOL_LABEL}</SelectItem>
                 ) : null}
@@ -747,7 +761,9 @@ export function ManageMachineryDialog({
             ) : null}
             <p className="text-xs text-muted-foreground">
               {isNewMachinesMode
-                ? "Store is sending new equipment to this site (not from available / assigned / maintenance stock)."
+                ? isEditing
+                  ? "Store sent new equipment to this site (not from available / assigned / maintenance stock)."
+                  : "Add the machines first, then keep the movement date and gate pass here."
                 : isCustomPool
                   ? "Custom pool — saved for your company and reusable in this list."
                   : isStoreToSite
@@ -770,6 +786,7 @@ export function ManageMachineryDialog({
           </MotionField>
 
           {isNewMachinesMode ? (
+            isEditing ? (
             <>
               <MotionField label="Machinery type">
                 <Popover open={categoryPickerOpen} onOpenChange={setCategoryPickerOpen} modal={false}>
@@ -785,12 +802,16 @@ export function ManageMachineryDialog({
                       <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                     </Button>
                   </PopoverTrigger>
-                  <PopoverContent className="z-[100] w-[var(--radix-popover-trigger-width)] p-0" align="start">
-                    <Command>
+                  <PopoverContent className="z-[100] w-[var(--radix-popover-trigger-width)] overflow-hidden p-0" align="start">
+                    <Command className="flex flex-col overflow-hidden">
                       <CommandInput placeholder="Search category…" />
-                      <CommandList>
-                        <CommandEmpty>No category found.</CommandEmpty>
-                        <CommandGroup>
+                      <div
+                        className="max-h-[min(260px,45vh)] overflow-y-auto overscroll-y-contain touch-pan-y"
+                        onWheel={(e) => e.stopPropagation()}
+                      >
+                        <CommandList className="max-h-none overflow-visible">
+                          <CommandEmpty>No category found.</CommandEmpty>
+                          <CommandGroup>
                           {categoryOptions.map((category) => (
                             <CommandItem
                               key={category}
@@ -825,8 +846,9 @@ export function ManageMachineryDialog({
                             />
                             + Add new category
                           </CommandItem>
-                        </CommandGroup>
-                      </CommandList>
+                          </CommandGroup>
+                        </CommandList>
+                      </div>
                     </Command>
                   </PopoverContent>
                 </Popover>
@@ -893,6 +915,30 @@ export function ManageMachineryDialog({
                 <p className="text-xs text-muted-foreground">No quantity cap — new purchases from market.</p>
               </MotionField>
             </>
+            ) : (
+              <MotionField label="New machinery">
+                {newMachinesBatch ? (
+                  <div className="space-y-2 rounded-md border border-border bg-secondary/30 px-3 py-3">
+                    <p className="text-sm font-medium text-foreground">{newMachinesBatch.category}</p>
+                    <p className="text-xs text-muted-foreground">
+                      {formatQtyWithUnit(newMachinesBatch.quantity, newMachinesBatch.unitType)} assigned to this site.
+                    </p>
+                    <Button type="button" variant="outline" size="sm" onClick={() => setAddMachineryOpen(true)}>
+                      Add more machinery
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Button type="button" onClick={() => setAddMachineryOpen(true)}>
+                      Add machinery
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      Opens the same Add machinery form. After you create units, come back here for date and gate pass.
+                    </p>
+                  </div>
+                )}
+              </MotionField>
+            )
           ) : isCustomPool ? (
             <MotionField label="Machinery name">
               <Input
@@ -982,8 +1028,15 @@ export function ManageMachineryDialog({
           ) : null}
         </div>
 
-        <DialogFooter className="gap-2 sm:gap-0">
-          <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+        <DialogFooter className="shrink-0 gap-2 border-t border-border pt-4 sm:gap-0">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              if (addMachineryOpen) return;
+              setOpen(false);
+            }}
+          >
             Cancel
           </Button>
           <Button
@@ -992,7 +1045,9 @@ export function ManageMachineryDialog({
             disabled={
               isPending ||
               (isNewMachinesMode
-                ? !finalCategory || !resolvedUnitType || quantity < 1
+                ? isEditing
+                  ? !finalCategory || !resolvedUnitType || quantity < 1
+                  : !newMachinesBatch || newMachinesBatch.machineIds.length === 0
                 : isCustomPool
                   ? !activeCustomLabel || !customMachineryName.trim()
                   : !selectedLine)
@@ -1012,5 +1067,27 @@ export function ManageMachineryDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    <AddMachineryDialog
+      open={addMachineryOpen}
+      onOpenChange={setAddMachineryOpen}
+      showTrigger={false}
+      lockAssignedSite={site}
+      nested
+      onCreated={(batch) => {
+        setNewMachinesBatch((prev) => {
+          if (!prev) return batch;
+          const sameCategory = prev.category === batch.category;
+          return {
+            machineIds: [...prev.machineIds, ...batch.machineIds],
+            category: sameCategory ? prev.category : `${prev.category}, ${batch.category}`,
+            quantity: prev.quantity + batch.quantity,
+            unitType: prev.unitType,
+            label: sameCategory ? prev.label : `${prev.label}, ${batch.label}`,
+          };
+        });
+        setAddMachineryOpen(false);
+      }}
+    />
+    </>
   );
 }

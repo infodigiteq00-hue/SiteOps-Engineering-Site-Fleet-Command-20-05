@@ -14,6 +14,28 @@ function codePatternMatch(code: string): RegExpMatchArray | null {
   return code.match(/^([A-Za-z]+)([-_]?)(\d+)$/);
 }
 
+export function formatMachineryCode(
+  cursor: Pick<MachineryCodegenCursor, "codePrefix" | "codeSeparator" | "codeWidth">,
+  codeNumber: number,
+): string {
+  return `${cursor.codePrefix}${cursor.codeSeparator}${String(codeNumber).padStart(cursor.codeWidth, "0")}`;
+}
+
+/** Next free code for a cursor that is not already in reservedCodes (company-wide). */
+export function allocateNextFreeCode(
+  cursor: MachineryCodegenCursor,
+  reservedCodes: Set<string>,
+): string {
+  let code = formatMachineryCode(cursor, cursor.nextCodeNumber);
+  while (reservedCodes.has(code.toUpperCase())) {
+    cursor.nextCodeNumber += 1;
+    code = formatMachineryCode(cursor, cursor.nextCodeNumber);
+  }
+  reservedCodes.add(code.toUpperCase());
+  cursor.nextCodeNumber += 1;
+  return code;
+}
+
 /** Seed auto code/name counters for a category (existing DB + codes reserved in this import). */
 export function seedCategoryCodegen(
   category: string,
@@ -72,7 +94,7 @@ export function seedCategoryCodegen(
   };
 }
 
-/** Generate the next N machinery codes/names and advance the cursor. */
+/** Generate the next N machinery codes/names and advance the cursor. Skips codes already reserved. */
 export function takeMachineryUnitsFromCursor(
   cursor: MachineryCodegenCursor,
   quantity: number,
@@ -82,13 +104,45 @@ export function takeMachineryUnitsFromCursor(
   const units: Array<{ code: string; name: string }> = [];
 
   for (let i = 0; i < safeQty; i += 1) {
-    const code = `${cursor.codePrefix}${cursor.codeSeparator}${String(cursor.nextCodeNumber).padStart(cursor.codeWidth, "0")}`;
+    const code = allocateNextFreeCode(cursor, reservedCodes);
     const name = `${cursor.nameBase}${cursor.nextNameNumber}`;
     units.push({ code, name });
-    reservedCodes.add(code.toUpperCase());
-    cursor.nextCodeNumber += 1;
     cursor.nextNameNumber += 1;
   }
 
   return units;
+}
+
+/** Suggest codes/names for single-add UI using company-wide uniqueness. */
+export function suggestMachineryUnits(
+  category: string,
+  machines: Machine[],
+  quantity: number,
+): Array<{ code: string; name: string }> {
+  const reservedCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
+  const cursor = seedCategoryCodegen(category, machines, reservedCodes);
+  return takeMachineryUnitsFromCursor(cursor, quantity, reservedCodes);
+}
+
+/**
+ * Resolve unit codes for create: blank codes get the next free auto code;
+ * provided codes are kept as-is (caller validates uniqueness).
+ */
+export function resolveMachineryUnitCodes(
+  category: string,
+  machines: Machine[],
+  units: Array<{ code: string; name: string }>,
+): Array<{ code: string; name: string }> {
+  const reservedCodes = new Set(machines.map((machine) => machine.code.toUpperCase()));
+  const cursor = seedCategoryCodegen(category, machines, reservedCodes);
+
+  return units.map((unit) => {
+    const name = unit.name.trim();
+    const code = unit.code.trim();
+    if (code) {
+      reservedCodes.add(code.toUpperCase());
+      return { code, name };
+    }
+    return { code: allocateNextFreeCode(cursor, reservedCodes), name };
+  });
 }

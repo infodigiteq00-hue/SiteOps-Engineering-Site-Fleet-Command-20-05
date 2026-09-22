@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Users, MailPlus, Loader2 } from "lucide-react";
@@ -8,9 +8,10 @@ import { supabase, isSupabaseConfigured } from "@/lib/supabaseClient";
 import { formatCompanyLabel } from "@/lib/companyTenancy";
 import {
   appendAuditLedgerEntry,
-  operationalKeys,
+  refreshOperationalSlices,
   useCompanyNameMap,
 } from "@/hooks/useOperationalData";
+import { refreshAdminData, useTeamDataQuery, type TeamProfileRow } from "@/hooks/useAdminData";
 import { parsePlatformRole } from "@/lib/profileRole";
 import { isEmailJsConfigured, resolveSignupUrl, sendInviteEmail } from "@/lib/sendInviteEmail";
 import { useScopedSites } from "@/hooks/useCompanyScope";
@@ -24,26 +25,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "@/hooks/use-toast";
 
-type ProfileRow = {
-  id: string;
-  email: string | null;
-  full_name: string | null;
-  role: string;
-  company_id: string | null;
-  assigned_site_ids: string[] | null;
-};
-
-type CompanyInviteRow = {
-  id: string;
-  email: string;
-  full_name: string;
-  role: string;
-  assigned_site_ids: string[] | null;
-  status: string;
-  created_at: string;
-  expires_at: string | null;
-};
-
 const invitableRoles: PlatformRole[] = ["senior_manager", "store_manager", "site_manager"];
 const editableMemberRoles: PlatformRole[] = [...invitableRoles, "viewer"];
 
@@ -52,9 +33,11 @@ const Team = () => {
   const user = useCurrentUser();
   const companyNames = useCompanyNameMap();
   const scopedSites = useScopedSites();
-  const [rows, setRows] = useState<ProfileRow[]>([]);
-  const [pendingInvites, setPendingInvites] = useState<CompanyInviteRow[]>([]);
-  const [loading, setLoading] = useState(false);
+  const teamEnabled = canAccessTeamPage(user.role) && isSupabaseConfigured && Boolean(user.companyId);
+  const teamQuery = useTeamDataQuery(user.companyId, teamEnabled);
+  const rows = teamQuery.data?.profiles ?? [];
+  const pendingInvites = teamQuery.data?.invites ?? [];
+  const loading = teamQuery.isPending && teamQuery.data === undefined;
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteName, setInviteName] = useState("");
@@ -62,48 +45,30 @@ const Team = () => {
   const [inviteSiteIds, setInviteSiteIds] = useState<string[]>([]);
   const [inviteBusy, setInviteBusy] = useState(false);
   const [cancelInviteId, setCancelInviteId] = useState<string | null>(null);
-  const [editRow, setEditRow] = useState<ProfileRow | null>(null);
+  const [editRow, setEditRow] = useState<TeamProfileRow | null>(null);
   const [editRole, setEditRole] = useState<PlatformRole>("site_manager");
   const [editSites, setEditSites] = useState<string[]>([]);
   const [editBusy, setEditBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    if (!isSupabaseConfigured || user.role !== "firm_admin" || !user.companyId) return;
-    setLoading(true);
-    const [{ data: profiles, error: pErr }, { data: invites, error: iErr }] = await Promise.all([
-      supabase
-        .from("profiles")
-        .select("id, email, full_name, role, company_id, assigned_site_ids")
-        .eq("company_id", user.companyId)
-        .order("full_name", { ascending: true }),
-      supabase
-        .from("company_invites")
-        .select("id, email, full_name, role, assigned_site_ids, status, created_at, expires_at")
-        .eq("company_id", user.companyId)
-        .eq("status", "pending")
-        .order("created_at", { ascending: false }),
-    ]);
-    setLoading(false);
-    if (pErr) {
-      toast({ title: "Could not load team", description: pErr.message, variant: "destructive" });
-      return;
-    }
-    if (iErr) {
-      toast({ title: "Could not load invitations", description: iErr.message, variant: "destructive" });
-    }
-    setRows((profiles as ProfileRow[]) ?? []);
-    setPendingInvites((invites as CompanyInviteRow[]) ?? []);
-  }, [user.role, user.companyId]);
-
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (!teamQuery.error) return;
+    toast({
+      title: "Could not load team",
+      description: teamQuery.error instanceof Error ? teamQuery.error.message : "Try again.",
+      variant: "destructive",
+    });
+  }, [teamQuery.error]);
+
+  const refreshTeam = () => {
+    refreshAdminData(queryClient);
+    refreshOperationalSlices(queryClient, "ledger");
+  };
 
   const companyLabel = useMemo(() => formatCompanyLabel(user.companyId, companyNames), [user.companyId, companyNames]);
 
   const sitesById = useMemo(() => Object.fromEntries(scopedSites.map((s) => [s.id, s.name])), [scopedSites]);
 
-  const openEdit = (row: ProfileRow) => {
+  const openEdit = (row: TeamProfileRow) => {
     setEditRow(row);
     setEditRole(parsePlatformRole(row.role) as PlatformRole);
     setEditSites(Array.isArray(row.assigned_site_ids) ? row.assigned_site_ids : []);
@@ -147,12 +112,11 @@ const Team = () => {
       } catch (err) {
         console.warn("[ledger] skipped after user_role_changed", err);
       }
-      void queryClient.invalidateQueries({ queryKey: operationalKeys.all });
     }
 
     toast({ title: "Member updated" });
     setEditRow(null);
-    void load();
+    refreshTeam();
   };
 
   const revokeInvite = async (id: string) => {
@@ -181,11 +145,10 @@ const Team = () => {
       } catch (err) {
         console.warn("[ledger] skipped after invite_cancelled", err);
       }
-      void queryClient.invalidateQueries({ queryKey: operationalKeys.all });
     }
 
     toast({ title: "Invitation cancelled" });
-    void load();
+    refreshTeam();
   };
 
   const sendInvite = async () => {
@@ -257,8 +220,6 @@ const Team = () => {
     } catch (err) {
       console.warn("[ledger] skipped after user_invited", err);
     }
-    void queryClient.invalidateQueries({ queryKey: operationalKeys.all });
-
     const noSitesSiteManager = inviteRole === "site_manager" && scopedSites.length === 0;
     toast({
       title: isEmailJsConfigured() ? "Invitation saved and email sent" : "Invitation saved",
@@ -274,7 +235,7 @@ const Team = () => {
     setInviteEmail("");
     setInviteName("");
     setInviteSiteIds([]);
-    void load();
+    refreshTeam();
   };
 
   if (!canAccessTeamPage(user.role)) {

@@ -141,8 +141,8 @@ export const AppShell = () => {
           {isSupabaseEnabled && isBootstrapping ? (
             <div className="flex min-h-[50vh] flex-col items-center justify-center gap-3 text-center text-muted-foreground">
               <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" aria-hidden />
-              <p className="text-sm font-medium text-foreground">Loading organization data…</p>
-              <p className="max-w-sm text-xs">Sites, machinery, and requests are syncing. This may take a moment on first load.</p>
+              <p className="text-sm font-medium text-foreground">Loading this page…</p>
+              <p className="max-w-sm text-xs">Only first-load data is fetched. Later refreshes reuse what is already on this page.</p>
             </div>
           ) : isSupabaseEnabled && hasError ? (
             <div className="flex min-h-[40vh] flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-card/50 p-8 text-center">

@@ -25,7 +25,7 @@ export function buildClosureSummaryFromDispositions(
   return summary;
 }
 
-function parseClosureActionFromSummary(summary: string): keyof Pick<
+export function parseClosureActionFromSummary(summary: string): keyof Pick<
   SiteClosureSummary,
   "available" | "maintenance" | "relocate" | "lost_damaged"
 > | null {

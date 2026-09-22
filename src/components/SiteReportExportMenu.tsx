@@ -47,8 +47,8 @@ export function SiteReportExportMenu({ site, ledger, machines }: Props) {
     try {
       openSiteReportPdf(report);
       toast({
-        title: "Opening print view",
-        description: "Use Save as PDF in the print dialog if needed.",
+        title: "Report opened",
+        description: "Click Download PDF (top right), then choose Save as PDF in the print dialog.",
       });
     } catch (err) {
       toast({
@@ -80,7 +80,7 @@ export function SiteReportExportMenu({ site, ledger, machines }: Props) {
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <p className="px-2 py-1.5 text-[10px] leading-snug text-muted-foreground">
-          Simple table: machinery, on-site count, IN/OUT with gate pass &amp; date
+          Simple table: machinery, on-site count, IN/OUT with gate pass, date, and qty
         </p>
       </DropdownMenuContent>
     </DropdownMenu>

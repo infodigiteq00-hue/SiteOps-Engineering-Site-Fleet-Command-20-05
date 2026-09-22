@@ -49,6 +49,8 @@ export interface Machine {
   category: MachineryCategory;
   /** Quantity unit — nos, metre, kg, etc. */
   unitType: MachineryUnitType;
+  /** On-hand quantity represented by this row (default 1). */
+  stockQuantity: number;
   status: MachineryStatus;
   assignedSiteId: string | null;
   /** Site where unit was marked lost/damaged (e.g. during site finish). */
@@ -59,6 +61,8 @@ export interface Machine {
   assignedTo?: string;
   approvedBy?: string;
   closureNotes?: string;
+  invoiceNumber?: string;
+  purchaseDate?: string;
 }
 
 export interface Request {

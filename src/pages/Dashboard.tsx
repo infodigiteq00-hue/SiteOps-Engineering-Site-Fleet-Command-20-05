@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Building2, Wrench, ClipboardList, CheckCircle2, ArrowRight, Activity, ChevronDown } from "lucide-react";
+import { Building2, Wrench, ClipboardList, CheckCircle2, ArrowRight, Activity, ChevronDown, Package, AlertTriangle } from "lucide-react";
 import { Link, Navigate } from "react-router-dom";
 import { StatCard } from "@/components/StatCard";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -71,18 +71,18 @@ const Dashboard = () => {
           accent="cyan"
         />
         <StatCard
-          label="Pending Requests"
-          value={statValue(metrics.pending)}
-          icon={ClipboardList}
-          trend="Awaiting approval"
-          accent="orange"
+          label="Total Machinery Available"
+          value={statValue(metrics.available)}
+          icon={Package}
+          trend="Ready to deploy"
+          accent="green"
         />
         <StatCard
-          label="Approved (All time)"
-          value={statValue(metrics.ledgerEntries)}
-          icon={CheckCircle2}
-          trend="Ledger entries"
-          accent="green"
+          label="Total Lost or Damaged"
+          value={statValue(metrics.lostDamaged)}
+          icon={AlertTriangle}
+          trend="Marked lost / damaged"
+          accent="orange"
         />
       </div>
 
